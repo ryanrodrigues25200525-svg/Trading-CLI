@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import math
 import os
 import sqlite3
 import sys
@@ -66,11 +67,22 @@ def _err(error: str):
 @contextlib.contextmanager
 def _get_conn():
     """Yield a SQLite connection (check_same_thread=False for web) and always close it."""
-    conn = sqlite3.connect(pt._db_path() if hasattr(pt, '_db_path') else pt.DB, timeout=10, isolation_level=None, check_same_thread=False)
+    try:
+        # check_same_thread=False: _run() hands this connection to a thread-pool worker.
+        conn = pt._connect(check_same_thread=False)
+    except SystemExit as exc:
+        raise RuntimeError(str(exc))
     try:
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # Ensure schema/migrations exist so a fresh DB isn't a 500 on every route.
+        conn.executescript(pt.SCHEMA)
+        if conn.execute("PRAGMA user_version").fetchone()[0] < pt.SCHEMA_VERSION:
+            with pt.writing(conn):
+                if conn.execute("PRAGMA user_version").fetchone()[0] < pt.SCHEMA_VERSION:
+                    pt.migrate(conn)
+                    conn.execute(f"PRAGMA user_version={pt.SCHEMA_VERSION}")
         yield conn
     finally:
         try:
@@ -111,6 +123,46 @@ def _safe(fn, *a, **kw):
         return _err(str(exc))
     except Exception as exc:
         return _err(f"{type(exc).__name__}: {exc}")
+
+
+async def _body(request: Request) -> dict | JSONResponse:
+    """Parse a JSON object body; return {} on empty, _err(...) on anything invalid."""
+    try:
+        data = await request.json()
+    except Exception:
+        return _err("invalid JSON body")
+    if not isinstance(data, dict):
+        return _err("JSON body must be an object")
+    return data
+
+
+def _str_field(data: dict, key: str, default: str = "", required: bool = True):
+    """Coerce a body field to a stripped string. Returns (value, error_response)."""
+    raw = data.get(key, default)
+    if raw is None:
+        raw = ""
+    if not isinstance(raw, str):
+        raw = str(raw)
+    value = raw.strip()
+    if required and not value:
+        return "", _err(f"{key} required")
+    return value, None
+
+
+def _float_field(data: dict, key: str, default=None):
+    """Coerce a body field to a finite float. Returns (value, error_response)."""
+    raw = data.get(key, default)
+    if raw is None or raw == "":
+        return default, None
+    if isinstance(raw, bool):
+        return None, _err(f"{key} must be a number")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None, _err(f"{key} must be a number")
+    if not math.isfinite(value):
+        return None, _err(f"{key} must be a finite number")
+    return value, None
 
 # ---------------------------------------------------------------------------
 # Static / Frontend
@@ -196,11 +248,17 @@ async def api_accounts():
 
 @app.post("/api/accounts")
 async def api_create_account(request: Request):
-    body = await request.json()
-    name = body.get("name", "").strip()
-    cash = float(body.get("cash", 0))
-    if not name:
-        return _err("name required")
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    name, err = _str_field(body, "name")
+    if err:
+        return err
+    cash, err = _float_field(body, "cash", None)
+    if err:
+        return err
+    if cash is None:
+        return _err("cash must be a number")
     with _get_conn() as conn:
         return _safe(pt.create_account, conn, name, cash, source="web")
 
@@ -213,8 +271,14 @@ async def api_set_default(name: str):
 
 @app.post("/api/accounts/{name}/deposit")
 async def api_deposit(name: str, request: Request):
-    body = await request.json()
-    amount = float(body.get("amount", 0))
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    amount, err = _float_field(body, "amount")
+    if err:
+        return err
+    if amount is None:
+        return _err("amount required")
     with _get_conn() as conn:
         return _safe(pt.adjust_cash, conn, name, amount, source="web")
 
@@ -259,31 +323,45 @@ async def api_positions(account: str | None = Query(None)):
 
 @app.post("/api/positions/close")
 async def api_close_position(request: Request):
-    body = await request.json()
-    account = body.get("account")
-    symbol = body.get("symbol", "").upper()
-    qty = body.get("qty")
-    percent = body.get("percent")
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    account, err = _str_field(body, "account", required=False)
+    if err:
+        return err
+    symbol, err = _str_field(body, "symbol")
+    if err:
+        return err
+    qty, err = _float_field(body, "qty")
+    if err:
+        return err
+    percent, err = _float_field(body, "percent")
+    if err:
+        return err
     if not symbol:
         return _err("symbol required")
     with _get_conn() as conn:
         try:
-            name = _resolve(conn, account)
+            name = _resolve(conn, account or None)
         except SystemExit as exc:
             return _err(str(exc))
         return _safe(
-            pt.close_position, conn, name, symbol,
+            pt.close_position, conn, name, symbol.upper(),
             qty=qty, percent=percent, source="web",
         )
 
 
 @app.post("/api/positions/close-all")
 async def api_close_all(request: Request):
-    body = await request.json()
-    account = body.get("account")
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    account, err = _str_field(body, "account", required=False)
+    if err:
+        return err
     with _get_conn() as conn:
         try:
-            name = _resolve(conn, account)
+            name = _resolve(conn, account or None)
         except SystemExit as exc:
             return _err(str(exc))
         return _safe(pt.close_all_positions, conn, name, source="web")
@@ -334,34 +412,61 @@ async def api_orders(
 
 @app.post("/api/orders")
 async def api_place_order(request: Request):
-    body = await request.json()
-    account = body.get("account")
-    symbol = body.get("symbol", "").upper()
-    side = body.get("side", "buy").lower()
-    qty = float(body.get("qty", 0))
-    order_type = body.get("order_type", "market")
-    limit_price = body.get("limit_price")
-    stop_price = body.get("stop_price")
-    trail_percent = body.get("trail_percent")
-    time_in_force = body.get("time_in_force", "gtc")
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    account, err = _str_field(body, "account", required=False)
+    if err:
+        return err
+    symbol, err = _str_field(body, "symbol")
+    if err:
+        return err
+    side, err = _str_field(body, "side", "buy")
+    if err:
+        return err
+    qty, err = _float_field(body, "qty")
+    if err:
+        return err
+    order_type, err = _str_field(body, "order_type", "market")
+    if err:
+        return err
+    limit_price, err = _float_field(body, "limit_price")
+    if err:
+        return err
+    stop_price, err = _float_field(body, "stop_price")
+    if err:
+        return err
+    trail_percent, err = _float_field(body, "trail_percent")
+    if err:
+        return err
+    time_in_force, err = _str_field(body, "time_in_force", "gtc")
+    if err:
+        return err
 
     if not symbol:
         return _err("symbol required")
-    if qty <= 0:
+    if qty is None or qty <= 0:
         return _err("qty must be > 0")
 
     with _get_conn() as conn:
         try:
-            name = _resolve(conn, account)
+            name = _resolve(conn, account or None)
         except SystemExit as exc:
             return _err(str(exc))
 
-        if order_type == "market" and not limit_price and not stop_price:
+        # place() always fills at market and records gtc — only use it for plain market TIFs.
+        # opg/cls must go through submit_order so they rest until their auction.
+        if (
+            order_type == "market"
+            and not limit_price
+            and not stop_price
+            and time_in_force.lower() == "gtc"
+        ):
             return _safe(
-                pt.place, conn, name, symbol, side, qty, source="web",
+                pt.place, conn, name, symbol.upper(), side.lower(), qty, None, source="web",
             )
         return _safe(
-            pt.submit_order, conn, name, symbol, side, qty,
+            pt.submit_order, conn, name, symbol.upper(), side.lower(), qty,
             order_type=order_type,
             limit_price=limit_price,
             stop_price=stop_price,
@@ -379,11 +484,15 @@ async def api_cancel_order(order_id: int):
 
 @app.post("/api/orders/cancel-all")
 async def api_cancel_all_orders(request: Request):
-    body = await request.json()
-    account = body.get("account")
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    account, err = _str_field(body, "account", required=False)
+    if err:
+        return err
     with _get_conn() as conn:
         try:
-            name = _resolve(conn, account)
+            name = _resolve(conn, account or None)
         except SystemExit as exc:
             return _err(str(exc))
         return _safe(pt.cancel_all_orders, conn, name, source="web")
@@ -435,15 +544,25 @@ async def api_watchlists(account: str | None = Query(None)):
 
 @app.post("/api/watchlists")
 async def api_create_watchlist(request: Request):
-    body = await request.json()
-    account = body.get("account")
-    wl_name = body.get("name", "").strip()
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    account, err = _str_field(body, "account", required=False)
+    if err:
+        return err
+    wl_name, err = _str_field(body, "name")
+    if err:
+        return err
     symbols = body.get("symbols", [])
-    if not wl_name:
-        return _err("name required")
+    if symbols is None:
+        symbols = []
+    if isinstance(symbols, str):
+        symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+    if not isinstance(symbols, list):
+        return _err("symbols must be a list")
     with _get_conn() as conn:
         try:
-            name = _resolve(conn, account)
+            name = _resolve(conn, account or None)
         except SystemExit as exc:
             return _err(str(exc))
         return _safe(pt.create_watchlist, conn, name, wl_name, symbols=symbols, source="web")
@@ -560,8 +679,11 @@ async def api_backtest(
             result = await _run(pbt.run_portfolio_backtest, conn, name, lookback_days=days)
         except RuntimeError as exc:
             return _err(str(exc))
-        # Normalize curve to [{date, equity}]
-        curve = [{"date": c[0], "equity": c[1]} for c in result.get("curve", [])]
+        # Normalize curve to [{date, equity}] — points may be dicts (portfolio_backtest) or pairs.
+        curve = [
+            {"date": p["date"], "equity": p["equity"]} if isinstance(p, dict) else {"date": p[0], "equity": p[1]}
+            for p in result.get("curve", [])
+        ]
         return _ok({
             "status": result.get("status"),
             "metrics": result.get("metrics", {}),
@@ -623,19 +745,40 @@ async def api_get_risk(account: str):
 
 @app.put("/api/risk/{account}")
 async def api_set_risk(account: str, request: Request):
-    body = await request.json()
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    fields = {}
+    for key in (
+        "max_gross_leverage",
+        "max_order_notional",
+        "borrow_bps",
+        "commission_bps",
+        "slippage_bps",
+    ):
+        value, err = _float_field(body, key)
+        if err:
+            return err
+        fields[key] = value
+    # Booleans are passed through the same finite check: 1e999 would otherwise be stored
+    # as truthy and serialized as Infinity in the audit trail, breaking every later read.
+    for key in ("allow_short", "allow_naked_options", "allow_fractional"):
+        raw = body.get(key)
+        if raw is None:
+            fields[key] = None
+            continue
+        if isinstance(raw, bool):
+            fields[key] = raw
+            continue
+        number, err = _float_field(body, key)
+        if err:
+            return err
+        fields[key] = bool(number)
     with _get_conn() as conn:
         return _safe(
             pt.set_risk_limits, conn, account,
-            allow_short=body.get("allow_short"),
-            allow_naked_options=body.get("allow_naked_options"),
-            max_gross_leverage=body.get("max_gross_leverage"),
-            max_order_notional=body.get("max_order_notional"),
-            borrow_bps=body.get("borrow_bps"),
-            commission_bps=body.get("commission_bps"),
-            slippage_bps=body.get("slippage_bps"),
-            allow_fractional=body.get("allow_fractional"),
             source="web",
+            **fields,
         )
 
 
@@ -645,29 +788,40 @@ async def api_set_risk(account: str, request: Request):
 
 @app.get("/api/events")
 async def api_events(account: str | None = Query(None), since_id: int = Query(0), limit: int = Query(100)):
+    # SQLite INTEGER is signed 64-bit; a larger id raises OverflowError, not SystemExit.
+    if not -(2**63) <= since_id < 2**63:
+        return _err("since_id out of range")
     with _get_conn() as conn:
         try:
             evs = pt.list_events(conn, account, since_id=since_id, limit=limit)
-            return _ok(evs)
+            return _ok(pt._json_safe(evs))
         except SystemExit as exc:
             return _err(str(exc))
 
 @app.get("/api/events/stream")
-async def api_events_stream(account: str | None = Query(None), since_id: int = Query(0)):
+async def api_events_stream(request: Request, account: str | None = Query(None), since_id: int = Query(0)):
     from fastapi.responses import StreamingResponse
     import json as _json
+    import asyncio as _aio
+
+    if not -(2**63) <= since_id < 2**63:
+        return _err("since_id out of range")
+
     async def gen():
         last = since_id
         for _ in range(30):
+            # Stop promptly on client disconnect instead of holding shutdown for 30s.
+            if await request.is_disconnected():
+                break
             with _get_conn() as conn:
                 try:
                     evs = pt.list_events(conn, account, since_id=last, limit=100)
-                except SystemExit:
+                except (SystemExit, RuntimeError, ValueError, OverflowError):
                     evs = []
             for ev in evs:
                 last = max(last, ev.get("id", last))
-                yield f"data: {_json.dumps(ev)}\n\n"
-            import asyncio as _aio
+                # allow_nan=False: a bare Infinity token breaks JSON.parse in the SPA.
+                yield f"data: {_json.dumps(pt._json_safe(ev), allow_nan=False)}\n\n"
             await _aio.sleep(1)
         yield "data: {\"done\": true}\n\n"
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -705,8 +859,13 @@ async def api_config_get(key: str):
 
 @app.put("/api/config/{key}")
 async def api_config_set(key: str, request: Request):
-    body = await request.json()
-    value = str(body.get("value", ""))
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    raw = body.get("value", "")
+    if raw is None:
+        raw = ""
+    value = raw if isinstance(raw, str) else str(raw)
     with _get_conn() as conn:
         return _safe(pt.config_set, conn, key, value, source="web")
 
@@ -720,6 +879,23 @@ async def api_config_delete(key: str):
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+def _content_disposition(name, extension):
+    """Build a Content-Disposition header that survives Latin-1-only header encoding."""
+    import urllib.parse
+
+    safe = "".join(ch if ch.isalnum() or ch in "-_. " else "_" for ch in name).strip() or "account"
+    quoted = urllib.parse.quote(f"{safe}-orders.{extension}")
+    return f"attachment; filename=orders.{extension}; filename*=UTF-8''{quoted}"
+
+
+@app.exception_handler(RuntimeError)
+async def _runtime_error_handler(request: Request, exc: RuntimeError):
+    """_run/_safe_run raise RuntimeError for SystemExit and unhandled papertrade
+    failures. Without this every such route returns a bare 500 instead of the
+    documented {"ok": false, "error": ...} envelope."""
+    return _err(str(exc))
+
+
 @app.get("/api/export")
 async def api_export(account: str | None = Query(None), limit: int = Query(5000), format: str = Query("csv")):
     with _get_conn() as conn:
@@ -731,7 +907,9 @@ async def api_export(account: str | None = Query(None), limit: int = Query(5000)
             try:
                 data = pt.export_history(conn, name, limit, fmt="parquet")
                 from fastapi.responses import Response
-                return Response(content=data, media_type="application/octet-stream", headers={"Content-Disposition": f"attachment; filename={name}-orders.parquet"})
+                # Headers are Latin-1; a non-ASCII account name needs RFC 5987 encoding.
+                disposition = _content_disposition(name, "parquet")
+                return Response(content=data, media_type="application/octet-stream", headers={"Content-Disposition": disposition})
             except SystemExit as exc:
                 return _err(str(exc))
         try:
@@ -742,12 +920,20 @@ async def api_export(account: str | None = Query(None), limit: int = Query(5000)
 
 @app.post("/api/import")
 async def api_import(request: Request):
-    body = await request.json()
-    account = body.get("account")
+    body = await _body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    account, err = _str_field(body, "account")
+    if err:
+        return err
     data = body.get("data", "")
-    fmt = body.get("format", "csv")
+    fmt, err = _str_field(body, "format", "csv")
+    if err:
+        return err
     if not account or not data:
         return _err("account and data required")
+    if fmt not in ("csv", "parquet"):
+        return _err("format must be csv or parquet")
     with _get_conn() as conn:
         try:
             name = _resolve(conn, account)

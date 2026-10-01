@@ -36,6 +36,27 @@ def _capture(fn, *args, **kw):
     return buf.getvalue().strip() or "ok"
 
 
+def _place_option(
+    conn, account, underlying, expiry, strike, kind, contracts, limit, side, agent, request_id
+):
+    """Build the OCC symbol and place the order on one connection.
+
+    build_occ raises SystemExit on a bad kind/strike/expiry, so it must run inside
+    _capture; doing both steps there keeps it to a single connection.
+    """
+    occ = pt.build_occ(underlying, expiry, strike, kind)
+    return pt.place(
+        conn,
+        account,
+        occ,
+        side,
+        contracts,
+        limit,
+        source=agent,
+        request_id=request_id,
+    )
+
+
 @mcp.tool()
 def account_create(
     name: str,
@@ -338,16 +359,18 @@ def buy_option(
 ) -> str:
     """Buy an option. expiry is YYYY-MM-DD, kind is 'C' or 'P', contracts x100 shares.
     Market order unless limit (premium) is given. Use option_chain to find valid expiries/strikes."""
-    occ = pt.build_occ(underlying, expiry, strike, kind)
     return _capture(
-        pt.place,
+        _place_option,
         account,
-        occ,
-        "buy",
+        underlying,
+        expiry,
+        strike,
+        kind,
         contracts,
         limit,
-        source=agent,
-        request_id=idempotency_key,
+        "buy",
+        agent,
+        idempotency_key,
     )
 
 
@@ -364,16 +387,18 @@ def sell_option(
     agent: str = "mcp",
 ) -> str:
     """Sell/write an option (opens a short if not covering). Same params as buy_option."""
-    occ = pt.build_occ(underlying, expiry, strike, kind)
     return _capture(
-        pt.place,
+        _place_option,
         account,
-        occ,
-        "sell",
+        underlying,
+        expiry,
+        strike,
+        kind,
         contracts,
         limit,
-        source=agent,
-        request_id=idempotency_key,
+        "sell",
+        agent,
+        idempotency_key,
     )
 
 
@@ -828,9 +853,14 @@ def audit_log(account: str | None = None, limit: int = 100, offset: int = 0) -> 
 
 
 @mcp.tool()
-def sync_corporate_actions(account: str | None = None, agent: str = "mcp") -> str:
+def sync_corporate_actions(
+    account: str | None = None,
+    idempotency_key: str | None = None,
+    agent: str = "mcp",
+) -> str:
     """Apply unseen Yahoo Finance stock/ETF dividends and splits exactly once."""
-    return _capture(pt.sync_corporate_actions, account, source=agent)
+    extra = {"request_id": idempotency_key} if idempotency_key else {}
+    return _capture(pt.sync_corporate_actions, account, source=agent, **extra)
 
 
 @mcp.tool()
@@ -1463,10 +1493,13 @@ def _json_payload(result):
 
 
 def _json_success(result):
+    # allow_nan=False: a bare Infinity token makes the whole envelope unparseable by
+    # strict clients (JSON.parse, json.loads with parse_constant).
     return json.dumps(
-        {"ok": True, "data": _json_payload(result)},
+        {"ok": True, "data": pt._json_safe(_json_payload(result))},
         separators=(",", ":"),
         default=str,
+        allow_nan=False,
     )
 
 
@@ -1474,6 +1507,7 @@ def _json_error(message, code="tool_error"):
     return json.dumps(
         {"ok": False, "error": {"code": code, "message": str(message)}},
         separators=(",", ":"),
+        allow_nan=False,
     )
 
 

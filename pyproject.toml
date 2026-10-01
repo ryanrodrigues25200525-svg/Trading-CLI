@@ -26,6 +26,7 @@ dependencies = [
   "yfinance>=1,<2",
   "fastapi>=0.100,<1",
   "uvicorn>=0.20,<1",
+  "pyarrow>=14,<19",
 ]
 
 [project.scripts]

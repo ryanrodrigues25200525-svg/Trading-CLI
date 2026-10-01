@@ -237,13 +237,34 @@ def migrate(conn):
     )
 
 
+def _connect(path: str | None = None, check_same_thread: bool = True):
+    """Open a WAL connection to the trading DB. Raises SystemExit with an actionable
+    message instead of a raw sqlite3 traceback when the path is unusable."""
+    target = path or _db_path()
+    if target not in (":memory:",) and not target.startswith("file:"):
+        parent = os.path.dirname(os.path.expanduser(target)) or "."
+        if not os.path.isdir(parent):
+            raise SystemExit(f"database directory does not exist: {parent}")
+    try:
+        conn = sqlite3.connect(
+            target, timeout=10, isolation_level=None, check_same_thread=check_same_thread
+        )
+    except sqlite3.Error as exc:
+        raise SystemExit(f"cannot open database {target}: {exc}")
+    return conn
+
+
 def db():
     # WAL + busy_timeout + autocommit so multiple agents (Codex, Claude Code, Hermes) share the DB.
     # Mutations must run inside writing() so BEGIN IMMEDIATE serializes read-modify-write.
-    conn = sqlite3.connect(_db_path(), timeout=10, isolation_level=None)
-    conn.execute("PRAGMA busy_timeout=10000")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn = _connect()
+    try:
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.Error as exc:
+        conn.close()
+        raise SystemExit(f"cannot use database {_db_path()}: {exc}")
     conn.executescript(SCHEMA)
     if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
         with writing(conn):
@@ -278,7 +299,19 @@ def _context(source="unknown", request_id=None):
 
 
 def _json_details(details):
-    return json.dumps(details or {}, sort_keys=True, separators=(",", ":"))
+    return json.dumps(details or {}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _json_safe(value):
+    """Replace non-finite floats (inf/-inf/NaN) so payloads stay valid strict JSON.
+    Bare Infinity tokens are rejected by JSON.parse and by FastAPI's encoder."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _idempotent_action(conn, action, account, source, request_id, details):
@@ -497,11 +530,21 @@ def option_price(occ):
     if rows.empty:
         raise SystemExit(f"no {strike:g} strike for {root} {expiry}")
     r = rows.iloc[0]
-    bid, ask, last = float(r.bid), float(r.ask), float(r.lastPrice)
-    mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
-    if mid <= 0:
+    bid, ask, last = _finite_or_none(r.bid), _finite_or_none(r.ask), _finite_or_none(r.lastPrice)
+    mid = (bid + ask) / 2 if bid and ask and bid > 0 and ask > 0 else last
+    if mid is None or not math.isfinite(mid) or mid <= 0:
+        # Thin contracts quote NaN — never let that reach cash/positions.
         raise SystemExit(f"no tradeable price for {occ}")
     return mid
+
+
+def _finite_or_none(value):
+    """Coerce a yfinance field to a finite float, else None (Yahoo returns NaN/str)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _quiet_yf():
@@ -522,9 +565,10 @@ def live_price(symbol):
         p = yf.Ticker(symbol).fast_info["lastPrice"]
     except Exception:
         p = None
-    if not p or p <= 0:
+    price = _finite_or_none(p)
+    if price is None or price <= 0:
         raise SystemExit(f"no price for {symbol} (unknown or delisted symbol?)")
-    return float(p)
+    return price
 
 
 def _apply(state, symbol, side, qty, price):
@@ -643,6 +687,56 @@ def _exposure(state, target_symbol, target_price):
     return equity, gross
 
 
+def _naked_option_reason(state, root, cp):
+    """Check whether short calls/puts on `root` are covered. A long option only offsets a
+    short when it is further out-of-the-money (lower strike for calls, higher for puts), so
+    a vertical spread with the long on the wrong side is still naked."""
+    shares = max(0.0, state["pos"].get(root, {}).get("qty", 0.0))
+    longs, shorts = [], []
+    for other, position in state["pos"].items():
+        if position["ac"] != "option" or position["qty"] == 0:
+            continue
+        other_root, _expiry, strike, other_cp = parse_occ(other)
+        if other_root != root or other_cp != cp:
+            continue
+        (longs if position["qty"] > 0 else shorts).append((strike, abs(position["qty"])))
+    if not shorts:
+        return None
+    if cp == "C":
+        # A long call covers a short call only if its strike is <= the short's strike.
+        for strike, short_qty in shorts:
+            covered = sum(qty for long_strike, qty in longs if long_strike <= strike)
+            if short_qty - covered > shares + 1e-9:
+                return (
+                    f"naked calls disabled: need {short_qty:g} {root} shares "
+                    f"(strike {strike:g}), have {shares:g}"
+                )
+        return None
+    # A long put caps a short put's loss at the strike width, so a bear put spread
+    # needs only the width in cash, not the full strike value. Covering requires the long
+    # at a LOWER strike (long 100P caps short 200P at 100 of loss per contract).
+    required_cash = 0.0
+    for strike, short_qty in shorts:
+        covering = sorted(
+            ((long_strike, qty) for long_strike, qty in longs if long_strike <= strike),
+            key=lambda item: item[0],
+        )
+        remaining = short_qty
+        for long_strike, long_qty in covering:
+            if remaining <= 1e-9:
+                break
+            use = min(remaining, long_qty)
+            required_cash += use * (strike - long_strike) * 100
+            remaining -= use
+        required_cash += remaining * strike * 100
+    if state["cash"] + 1e-9 < required_cash:
+        return (
+            f"naked puts disabled: need {required_cash:,.2f} cash-secured, "
+            f"have {state['cash']:,.2f}"
+        )
+    return None
+
+
 def _risk_report_locked(conn, account, symbol, side, qty, price, before, after):
     limits = risk_limits(conn, account)
     old_qty = before["pos"].get(symbol, {}).get("qty", 0.0)
@@ -656,36 +750,8 @@ def _risk_report_locked(conn, account, symbol, side, qty, price, before, after):
         if not limits["allow_short"]:
             reason = "short positions are disabled for this account"
         elif ac == "option" and not limits["allow_naked_options"]:
-            root, _expiry, strike, cp = parse_occ(symbol)
-            if cp == "C":
-                shares = max(0.0, after["pos"].get(root, {}).get("qty", 0.0))
-                required = sum(
-                    abs(p["qty"]) * 100
-                    for other, p in after["pos"].items()
-                    if p["ac"] == "option"
-                    and p["qty"] < 0
-                    and parse_occ(other)[0] == root
-                    and parse_occ(other)[3] == "C"
-                )
-                if shares + 1e-9 < required:
-                    reason = (
-                        f"naked calls disabled: need {required:g} {root} shares, "
-                        f"have {shares:g}"
-                    )
-            else:
-                required = sum(
-                    abs(p["qty"]) * parse_occ(other)[2] * 100
-                    for other, p in after["pos"].items()
-                    if p["ac"] == "option"
-                    and p["qty"] < 0
-                    and parse_occ(other)[0] == root
-                    and parse_occ(other)[3] == "P"
-                )
-                if after["cash"] + 1e-9 < required:
-                    reason = (
-                        f"naked puts disabled: need {required:,.2f} cash-secured, "
-                        f"have {after['cash']:,.2f}"
-                    )
+            root, _expiry, _strike, cp = parse_occ(symbol)
+            reason = _naked_option_reason(after, root, cp)
 
     if (
         not reason
@@ -772,7 +838,7 @@ def preview_order(conn, account, symbol, side, qty, price=None, price_fn=None):
         return _preview_locked(conn, account, symbol, side, qty, price)
 
 
-def _fill_locked(conn, account, symbol, side, qty, price, enforce_risk=True):
+def _fill_locked(conn, account, symbol, side, qty, price, enforce_risk=True, order_id=None):
     """Apply a fill while the caller owns a writing() transaction."""
     # Fractional check (options already whole-number checked by caller)
     rl = risk_limits(conn, account)
@@ -787,10 +853,10 @@ def _fill_locked(conn, account, symbol, side, qty, price, enforce_risk=True):
     if extra_bps and side == "buy":
         fill_price = price * (1 + extra_bps / 10000)
     elif extra_bps and side == "sell":
-        # Sell proceeds reduced by commission/slippage
-        fill_price = price * (1 - extra_bps / 10000)
-        if fill_price <= 0:
-            raise SystemExit("commission/slippage would make fill price non-positive")
+        # Sell proceeds reduced by commission/slippage. A zero-value sale (an expired
+        # worthless option, or exercise) has no proceeds to charge, so the drag floors
+        # at 0 rather than inverting into a negative price.
+        fill_price = max(0.0, price * (1 - extra_bps / 10000))
     before = _portfolio_state_locked(conn, account)
     state = _clone_state(before)
     _apply(state, symbol, side, qty, fill_price)
@@ -808,11 +874,119 @@ def _fill_locked(conn, account, symbol, side, qty, price, enforce_risk=True):
         conn.execute(
             "DELETE FROM positions WHERE account=? AND symbol=?", (account, symbol)
         )
+    margin_calls = []
+    if state["cash"] < -1e-9:
+        # A futures gap can cost more than the margin posted. Liquidate what remains at
+        # the current mark, then floor cash at zero so the ledger (and withdrawals)
+        # stay valid; the uncovered remainder is booked as realized loss.
+        margin_calls = _margin_call_locked(conn, account, state, symbol, price)
     conn.execute(
         "UPDATE accounts SET cash=?, realized=realized+? WHERE name=?",
         (state["cash"], state["realized"], account),
     )
+    _sync_exit_legs_locked(conn, account, symbol, exclude_order_id=order_id)
+    for closed, mark in margin_calls:
+        print(f"margin call: liquidated {closed} at {mark:,.2f} to cover the deficit")
     return report
+
+
+def _margin_call_locked(conn, account, state, filled_symbol, price):
+    """Force-liquidate positions at the current mark until cash is non-negative."""
+    liquidated = []
+    held = sorted(state["pos"])
+    # Liquidate the triggering contract first, then everything else at cost.
+    ordered = [filled_symbol] + [s for s in held if s != filled_symbol]
+    for target in ordered:
+        if state["cash"] >= -1e-9:
+            break
+        position = state["pos"].get(target)
+        if not position:
+            continue
+        mark = price if target == filled_symbol else position["avg"]
+        qty = position["qty"]
+        if not qty:
+            continue
+        _apply(state, target, "sell" if qty > 0 else "buy", abs(qty), mark)
+        state["pos"].pop(target, None)
+        conn.execute(
+            "DELETE FROM positions WHERE account=? AND symbol=?", (account, target)
+        )
+        liquidated.append((target, mark))
+    if state["cash"] < -1e-9:
+        # Fully uncovered: book the uncovered remainder as realized loss and floor cash at
+        # zero, so deposits + realized + unrealized still reconciles with equity. The
+        # write-off is recorded so equity_curve's fill replay reproduces it.
+        deficit = -state["cash"]
+        _audit_locked(
+            conn,
+            "margin.call",
+            account,
+            "engine",
+            details={"amount": deficit, "reason": "loss exceeded margin"},
+        )
+        state["realized"] += state["cash"]
+        state["cash"] = 0.0
+    return liquidated
+
+
+def _sync_exit_legs_locked(conn, account, symbol, exclude_order_id=None):
+    """Keep bracket/OCO/OTO exit legs consistent with the position they protect.
+
+    A plain market sell (or a `replace` that shrinks the parent) can flatten or resize a
+    position without going through close_position(). Without this, orphaned legs would
+    later fill and conjure a position out of nothing.
+    """
+    row = conn.execute(
+        "SELECT qty FROM positions WHERE account=? AND symbol=?", (account, symbol)
+    ).fetchone()
+    position_qty = row[0] if row else 0.0
+    # Legs are the children of a filled entry, plus an OCO root (which is itself the
+    # take-profit leg). A bracket/OTO parent is an ENTRY, not an exit, so it must never be
+    # resized or canceled here. exclude_order_id is the order being filled right now; it
+    # must not cancel itself before its status is written.
+    legs = [
+        (oid, side, qty)
+        for oid, side, qty in conn.execute(
+            "SELECT o.id,o.side,o.qty FROM orders o WHERE o.account=? AND o.symbol=?"
+            " AND (o.parent_id IS NOT NULL OR o.order_class='oco')"
+            " AND o.status IN ('pending','held')"
+            # Skip legs whose parent entry has not filled yet: their size is the entry's.
+            " AND COALESCE((SELECT status FROM orders p WHERE p.id=o.parent_id),'filled')"
+            " IN ('filled','settled','exercised')"
+            " ORDER BY o.id",
+            (account, symbol),
+        )
+        if oid != exclude_order_id
+    ]
+    if not legs:
+        return
+    if not position_qty:
+        # Position is flat, so every leg is orphaned. Skip the order currently being
+        # filled — it is the one that closed the position and must still be recorded.
+        for oid, _side, _qty in legs:
+            conn.execute(
+                "UPDATE orders SET status='canceled', reject_reason='position closed'"
+                " WHERE id=?",
+                (oid,),
+            )
+        return
+    # Exit legs must reduce the position, so they trade opposite to it.
+    cover_side = "sell" if position_qty > 0 else "buy"
+    # Bracket/OCO legs are mutually exclusive ALTERNATIVES, each sized for the whole
+    # position. They do not consume the position between them, so cap each one
+    # independently and never cancel a healthy sibling.
+    for oid, side, qty in legs:
+        if side != cover_side:
+            # This leg would open a position rather than reduce one.
+            conn.execute(
+                "UPDATE orders SET status='canceled', reject_reason='position closed'"
+                " WHERE id=?",
+                (oid,),
+            )
+        elif qty > abs(position_qty) + 1e-9:
+            conn.execute(
+                "UPDATE orders SET qty=? WHERE id=?", (abs(position_qty), oid)
+            )
 
 
 def fill(conn, account, symbol, side, qty, price):
@@ -1155,6 +1329,7 @@ def _linked_exit_orders_locked(
     ts,
     source,
     order_class,
+    time_in_force="gtc",
 ):
     """Create held/active exit legs for bracket and OTO entry orders."""
     exit_side = "sell" if entry_side == "buy" else "buy"
@@ -1182,6 +1357,7 @@ def _linked_exit_orders_locked(
                 order_type="limit",
                 parent_id=parent_id,
                 order_class=order_class,
+                time_in_force=time_in_force,
             )
         )
     if stop_loss is not None:
@@ -1210,16 +1386,19 @@ def _linked_exit_orders_locked(
                 stop_price=stop,
                 parent_id=parent_id,
                 order_class=order_class,
+                time_in_force=time_in_force,
             )
         )
     return ids
 
 
-def _reserved_cash_locked(conn, account, exclude_order_id=None):
-    """Approximate buying power held by active opening orders."""
+def _reserved_cash_locked(conn, account, exclude_order_id=None, quote_symbol=None, quote=None):
+    """Approximate buying power held by active opening orders. `quote`/`quote_symbol`
+    supply the live price for a symbol that has never filled here, so market and auction
+    orders still reserve buying power instead of only failing at the open."""
     reserved = 0.0
-    for oid, symbol, side, qty, limit, stop, hwm in conn.execute(
-        "SELECT id,symbol,side,qty,limit_price,stop_price,hwm FROM orders"
+    for oid, symbol, side, qty, limit, stop, hwm, order_type in conn.execute(
+        "SELECT id,symbol,side,qty,limit_price,stop_price,hwm,order_type FROM orders"
         " WHERE account=? AND status='pending'",
         (account,),
     ):
@@ -1229,9 +1408,32 @@ def _reserved_cash_locked(conn, account, exclude_order_id=None):
         if asset_class == "future":
             reserved += abs(qty) * margin
         elif side == "buy":
-            reference = limit or stop or hwm or 0.0
+            # Reserve each pending order on its own terms. Only the order currently being
+            # validated has a live quote; pricing the others with it would misstate both
+            # directions (a stale stop reserve vs. a stale limit reserve).
+            if order_type == "limit":
+                # A limit buy fills at or below its limit, so that is the true cost.
+                reference = limit or _last_fill_price(conn, account, symbol)
+            elif order_type in ("stop", "stop_limit", "trailing_stop"):
+                reference = stop or hwm or _last_fill_price(conn, account, symbol)
+            else:  # market / auction
+                reference = (
+                    (quote if (symbol == quote_symbol and quote) else 0.0)
+                    or _last_fill_price(conn, account, symbol)
+                )
             reserved += qty * multiplier * reference
     return reserved
+
+
+def _last_fill_price(conn, account, symbol):
+    """Most recent filled price for a symbol, used as the reserve estimate for market
+    and auction orders that carry no limit/stop/high-water mark."""
+    row = conn.execute(
+        "SELECT filled_price FROM orders WHERE account=? AND symbol=? AND filled_price IS NOT NULL"
+        " ORDER BY id DESC LIMIT 1",
+        (account, symbol),
+    ).fetchone()
+    return row[0] if row and row[0] else 0.0
 
 
 def _require_available_cash_locked(
@@ -1250,7 +1452,9 @@ def _require_available_cash_locked(
     cash = conn.execute(
         "SELECT cash FROM accounts WHERE name=?", (account,)
     ).fetchone()[0]
-    available = cash - _reserved_cash_locked(conn, account, exclude_order_id)
+    available = cash - _reserved_cash_locked(
+        conn, account, exclude_order_id, quote_symbol=symbol, quote=price
+    )
     if required > available + 1e-9:
         raise SystemExit(
             f"insufficient buying power after open orders: need {required:,.2f}, "
@@ -1317,6 +1521,10 @@ def submit_order(
         trail_price = _positive(trail_price, "trail price")
     if trail_percent is not None:
         trail_percent = _positive(trail_percent, "trail percent")
+        # A stop more than 100% below the high can never trigger and produces a
+        # negative stop_price that lingers as an unfillable pending order.
+        if trail_percent >= 100:
+            raise SystemExit("trail percent must be below 100")
     if order_type in ("limit", "stop_limit") and limit_price is None:
         raise SystemExit(f"{order_type.replace('_', '-')} order requires a limit price")
     if order_type in ("stop", "stop_limit") and stop_price is None:
@@ -1374,6 +1582,13 @@ def submit_order(
                     "SELECT id FROM orders WHERE source=? AND request_id=?",
                     (source, request_id),
                 ).fetchone()
+                if row is None:
+                    # Audit log survived but the order didn't (reset/rm/wipe). Report it
+                    # instead of crashing on None.
+                    raise SystemExit(
+                        f"idempotency key '{request_id}' was used before, but that order "
+                        "no longer exists (account was reset or deleted)"
+                    )
                 print(f"idempotent replay: order #{row[0]}")
                 return row[0]
 
@@ -1423,6 +1638,12 @@ def submit_order(
                 "SELECT id FROM orders WHERE source=? AND request_id=?",
                 (source, request_id),
             ).fetchone()
+            if row is None:
+                # Audit log survived but the order didn't (reset/rm/wipe).
+                raise SystemExit(
+                    f"idempotency key '{request_id}' was used before, but that order "
+                    "no longer exists (account was reset or deleted)"
+                )
             print(f"idempotent replay: order #{row[0]}")
             return row[0]
         if not conn.execute(
@@ -1487,6 +1708,7 @@ def submit_order(
                 ts,
                 source,
                 "oco",
+                time_in_force=time_in_force,
             )
             _audit_locked(conn, "order.submit", account, source, request_id, intent)
             print(f"pending OCO #{oid} {side} {qty:g} {symbol}")
@@ -1499,8 +1721,12 @@ def submit_order(
         if not immediate and time_in_force in ("ioc", "fok"):
             status = "canceled"
         if status == "pending":
+            # Reserve on the order's own terms, matching how _reserved_cash_locked prices
+            # the other pending orders. Market/auction orders fill at the quote; every
+            # other type reserves at its own trigger/limit price.
+            reserve_price = validation_price
             _require_available_cash_locked(
-                conn, account, symbol, side, qty, validation_price
+                conn, account, symbol, side, qty, reserve_price
             )
         preview = _preview_locked(conn, account, symbol, side, qty, validation_price)
         if not preview["allowed"]:
@@ -1544,6 +1770,7 @@ def submit_order(
                 ts,
                 source,
                 order_class,
+                time_in_force=time_in_force,
             )
         _audit_locked(conn, "order.submit", account, source, request_id, intent)
     if status == "filled":
@@ -1929,7 +2156,7 @@ def close_all_positions(
     ids = []
     errors = []
     for symbol in symbols:
-        key = f"{request_id}:{symbol}" if request_id else None
+        key = _scoped_key(request_id, symbol)
         try:
             ids.append(
                 close_position(
@@ -1951,6 +2178,16 @@ def close_all_positions(
     else:
         print(f"closed {len(ids)} positions")
     return ids
+
+
+def _scoped_key(request_id, *parts, limit=128):
+    """Derive a per-symbol idempotency key that stays distinct even when request_id
+    is at the 128-char limit (naive f"{key}:{symbol}" truncates to the same value)."""
+    if not request_id:
+        return None
+    suffix = ":" + ":".join(str(part) for part in parts)
+    digest = __import__("hashlib").sha1(suffix.encode()).hexdigest()[:12]
+    return f"{request_id[: limit - len(suffix) - 14]}:{digest}"
 
 
 def get_position(conn, account, symbol, price_fn=None):
@@ -2189,6 +2426,52 @@ def do_not_exercise_option(conn, account, symbol, source="cli", request_id=None)
     print(f"marked {symbol} do-not-exercise")
 
 
+def _mleg_risk_reason_locked(conn, account, legs, prices):
+    """Evaluate a multi-leg option package against risk limits as a single trade."""
+    limits = risk_limits(conn, account)
+    before = _portfolio_state_locked(conn, account)
+    after = _clone_state(before)
+    for leg in legs:
+        _apply(after, leg["symbol"], leg["side"], leg["qty"], prices[leg["symbol"]])
+    # Notional cap applies to the whole package, not per leg.
+    total_notional = sum(
+        leg["qty"] * classify(leg["symbol"])[1] * prices[leg["symbol"]] for leg in legs
+    )
+    if (
+        limits["max_order_notional"] is not None
+        and total_notional > limits["max_order_notional"] + 1e-9
+    ):
+        return (
+            f"order notional {total_notional:,.2f} exceeds limit "
+            f"{limits['max_order_notional']:,.2f}"
+        )
+    # Short exposure is judged on the net package.
+    for symbol, position in after["pos"].items():
+        old_qty = before["pos"].get(symbol, {}).get("qty", 0.0)
+        qty = position["qty"]
+        if qty >= 0 or abs(qty) <= abs(min(old_qty, 0.0)) + 1e-9:
+            continue
+        if not limits["allow_short"]:
+            return f"short positions are disabled for this account"
+        if position["ac"] == "option" and not limits["allow_naked_options"]:
+            other_root, _expiry, _strike, cp = parse_occ(symbol)
+            reason = _naked_option_reason(after, other_root, cp)
+            if reason:
+                return reason
+    equity_before, gross_before = _exposure(before, legs[0]["symbol"], prices[legs[0]["symbol"]])
+    equity_after, gross_after = _exposure(after, legs[0]["symbol"], prices[legs[0]["symbol"]])
+    leverage = gross_after / equity_after if equity_after > 0 else math.inf
+    if (
+        gross_after > gross_before + 1e-9
+        and leverage > limits["max_gross_leverage"] + 1e-9
+    ):
+        return (
+            f"gross leverage {leverage:.2f}x exceeds limit "
+            f"{limits['max_gross_leverage']:.2f}x"
+        )
+    return None
+
+
 def submit_option_multileg(
     conn,
     account,
@@ -2259,6 +2542,12 @@ def submit_option_multileg(
             "SELECT 1 FROM accounts WHERE name=?", (account,)
         ).fetchone():
             raise SystemExit(f"no account '{account}'")
+        # Judge the package as a whole: per-leg checks would reject a legitimate
+        # long spread (the sold leg is short on its own) while letting a naked
+        # short through when the net happens to look covered.
+        reason = _mleg_risk_reason_locked(conn, account, clean, prices)
+        if reason:
+            raise SystemExit(f"risk rejected: {reason}")
         ids = []
         # Credit legs first avoids rejecting a valid net-credit/debit package mid-transaction.
         ordered = sorted(clean, key=lambda leg: leg["side"] == "buy")
@@ -2369,6 +2658,10 @@ def adjust_cash(conn, account, amount, source="cli", request_id=None):
             raise SystemExit(f"no account '{account}'")
         if amount < 0 and row[0] + amount < 0:
             raise SystemExit(f"insufficient cash: have {row[0]:,.2f}")
+        # Guard the running total, not just the delta: two individually valid deposits can
+        # still overflow to inf and permanently break every report on the account.
+        if not math.isfinite(row[0] + amount):
+            raise SystemExit("cash adjustment would overflow the account balance")
         conn.execute(
             "UPDATE accounts SET cash=cash+?, deposits=deposits+? WHERE name=?",
             (amount, amount, account),
@@ -2537,11 +2830,25 @@ def settle_expired(conn, price_fn=None):
         "SELECT account, symbol FROM positions WHERE asset_class='option'"
     ).fetchall()
     for account, occ in rows:
-        root, expiry, strike, cp = parse_occ(occ)
+        # parse_occ raises SystemExit on an unparseable symbol; an unparseable row must
+        # not skip settlement for every other expiring contract.
+        try:
+            root, expiry, strike, cp = parse_occ(occ)
+        except SystemExit as exc:
+            print(f"settlement skipped for {account}/{occ}: {exc}")
+            continue
         if expiry >= today:
             continue
-        spot = price_fn(root)  # network fetch outside the write lock
-        intrinsic = max(0.0, spot - strike) if cp == "C" else max(0.0, strike - spot)
+        # Per-position guard: one unaffordable/unquotable contract must not stop
+        # the remaining expiries from settling.
+        try:
+            spot = price_fn(root)  # network fetch outside the write lock
+            if not math.isfinite(float(spot)) or spot <= 0:
+                raise SystemExit(f"no usable price for {root}")
+            intrinsic = max(0.0, spot - strike) if cp == "C" else max(0.0, strike - spot)
+        except (SystemExit, TypeError, ValueError) as exc:
+            print(f"settlement failed for {account}/{occ}: {exc}")
+            continue
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         with writing(conn):
             # Another agent may have settled this option while its quote was loading.
@@ -2593,11 +2900,54 @@ def _auction_ready(time_in_force, now=None):
         ZoneInfo("America/New_York")
     )
     minute = eastern.hour * 60 + eastern.minute
-    if time_in_force == "opg":
-        return eastern.weekday() < 5 and 570 <= minute <= 580
-    if time_in_force == "cls":
-        return eastern.weekday() < 5 and 950 <= minute <= 970
-    return True
+    if time_in_force not in ("opg", "cls"):
+        return True
+    window = (570, 580) if time_in_force == "opg" else (950, 970)
+    if not (window[0] <= minute <= window[1]):
+        return False
+    # Weekday check alone fills auctions on market holidays; use the real XNYS calendar
+    # so opg/cls match market_clock().
+    try:
+        import pandas as pd
+
+        calendar = _nyse_calendar()
+        stamp = pd.Timestamp(now or datetime.now(timezone.utc))
+        stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+        return bool(calendar.is_open_on_minute(stamp))
+    except Exception:
+        return eastern.weekday() < 5
+
+
+def _order_defect(order):
+    """Return a reason string if this pending order is structurally unfillable
+    (missing prices, unknown type, NULL qty) — e.g. rows created by import_history.
+    Such an order must be rejected, not allowed to raise and abort the whole tick."""
+    if not order.get("side") in ("buy", "sell"):
+        return "side must be buy or sell"
+    if order.get("order_type") not in ORDER_TYPES:
+        return f"unknown order type '{order.get('order_type')}'"
+    qty = order.get("qty")
+    if qty is None or not math.isfinite(qty) or qty <= 0:
+        return "quantity must be a positive finite number"
+    if not order.get("ts"):
+        return "timestamp missing"
+    kind = order["order_type"]
+    limit, stop = order.get("limit_price"), order.get("stop_price")
+    if kind == "limit" and (limit is None or not math.isfinite(limit)):
+        return "limit price missing"
+    if kind in ("stop", "stop_limit") and (stop is None or not math.isfinite(stop)):
+        return "stop price missing"
+    if kind == "stop_limit" and (limit is None or not math.isfinite(limit)):
+        return "limit price missing"
+    if kind == "trailing_stop":
+        trail, pct = order.get("trail_price"), order.get("trail_percent")
+        if (trail is None) == (pct is None):
+            return "trailing stop needs exactly one of trail price or trail percent"
+        if trail is not None and not math.isfinite(trail):
+            return "trail price missing"
+        if pct is not None and not math.isfinite(pct):
+            return "trail percent missing"
+    return None
 
 
 def _pending_order_decision(order, price):
@@ -2680,6 +3030,9 @@ def _linked_after_terminal_locked(conn, order):
             (order["id"],),
         )
     elif order["order_class"] == "oco":
+        # OCO legs are strictly mutually exclusive, so one terminating cancels the other.
+        # Bracket/OTO legs are deliberately NOT canceled here: if one leg is rejected for
+        # cash, canceling its sibling would leave the position with no exit at all.
         root = order["parent_id"]
         conn.execute(
             "UPDATE orders SET status='canceled' WHERE (id=? OR parent_id=?)"
@@ -2688,11 +3041,81 @@ def _linked_after_terminal_locked(conn, order):
         )
 
 
-def tick(conn, price_fn=None):
+def charge_borrow(conn, price_fn=None):
+    """Accrue one day of borrow on open short positions for accounts with borrow_bps > 0.
+
+    Charged at most once per calendar day per account (tracked in config) so repeated
+    tick() calls in one session do not compound the fee.
+    """
     if price_fn is None:
         price_fn = live_price
+    today = datetime.now(timezone.utc).date().isoformat()
+    for (account,) in conn.execute(
+        "SELECT name FROM accounts WHERE name IN"
+        " (SELECT account FROM risk_settings WHERE borrow_bps > 0)"
+    ).fetchall():
+        stamp = f"borrow.last.{account}"
+        row = conn.execute("SELECT value FROM config WHERE key=?", (stamp,)).fetchone()
+        if row and row[0] == today:
+            continue
+        borrow_bps = risk_limits(conn, account).get("borrow_bps", 0) or 0
+        if borrow_bps <= 0:
+            continue
+        shorts = conn.execute(
+            "SELECT symbol,qty,avg_cost,mult,asset_class FROM positions"
+            " WHERE account=? AND qty<0",
+            (account,),
+        ).fetchall()
+        charged = 0.0
+        marks = {}
+        for symbol, qty, avg_cost, mult, asset_class in shorts:
+            if asset_class == "future":
+                mark = avg_cost  # futures are margined, not borrowed
+                continue
+            if symbol not in marks:
+                try:
+                    marks[symbol] = price_fn(symbol)
+                except SystemExit:
+                    marks[symbol] = avg_cost
+            mark = marks[symbol]
+            if not math.isfinite(mark) or mark <= 0:
+                mark = avg_cost
+            charged += abs(qty) * mult * mark * borrow_bps / 10000
+        with writing(conn):
+            if charged > 0:
+                conn.execute(
+                    "UPDATE accounts SET cash=cash-?, realized=realized-? WHERE name=?",
+                    (charged, charged, account),
+                )
+                # Not a cashflow: borrow is an internal cost, and a flow row here would be
+                # netted out as an external withdrawal, hiding it from total return.
+                _audit_locked(
+                    conn,
+                    "borrow.charge",
+                    account,
+                    "engine",
+                    details={"amount": charged, "date": today},
+                )
+                print(f"borrow: charged {charged:,.2f} on '{account}'")
+            conn.execute(
+                "INSERT OR REPLACE INTO config(key, value) VALUES(?,?)", (stamp, today)
+            )
+
+
+def tick(conn, price_fn=None):
     """Advance pending limit, stop, trailing, linked, and auction order state."""
-    settle_expired(conn, price_fn)
+    if price_fn is None:
+        price_fn = live_price
+    # Settlement failures must not abort the whole tick: one un-settleable position
+    # would otherwise wedge every pending order in every account forever.
+    try:
+        settle_expired(conn, price_fn)
+    except SystemExit as exc:
+        print(f"option settlement skipped: {exc}")
+    try:
+        charge_borrow(conn, price_fn)
+    except SystemExit as exc:
+        print(f"borrow accrual skipped: {exc}")
     columns = (
         "id,account,symbol,side,qty,limit_price,status,filled_price,ts,source,request_id,"
         "reject_reason,order_type,stop_price,trail_price,trail_percent,hwm,time_in_force,"
@@ -2708,6 +3131,23 @@ def tick(conn, price_fn=None):
     today = now.date().isoformat()
     for snapshot in pending:
         oid = snapshot["id"]
+        # Structurally broken rows (imported, hand-edited) must be rejected here —
+        # _pending_order_decision would raise on their NULL fields and strand every
+        # other pending order in every account.
+        defect = _order_defect(snapshot)
+        if defect:
+            with writing(conn):
+                conn.execute(
+                    "UPDATE orders SET status='rejected', reject_reason=? WHERE id=? AND status='pending'",
+                    (f"invalid order: {defect}", oid),
+                )
+                row = conn.execute(
+                    f"SELECT {columns} FROM orders WHERE id=?", (oid,)
+                ).fetchone()
+                if row:
+                    _linked_after_terminal_locked(conn, _order_dict(row))
+            print(f"rejected #{oid} {snapshot['symbol']}: invalid order: {defect}")
+            continue
         if (
             snapshot["time_in_force"] == "day"
             and snapshot["ts"][:10] < today
@@ -2727,6 +3167,17 @@ def tick(conn, price_fn=None):
         except SystemExit as exc:
             print(f"#{oid} {snapshot['symbol']}: {exc}")
             continue
+        # A non-finite quote (NaN/inf from a thin market) is "no usable price", not a fill.
+        # Filling with it would write inf/nan into cash and wedge the ledger for good.
+        try:
+            usable = float(price)
+        except (TypeError, ValueError):
+            print(f"#{oid} {snapshot['symbol']}: unusable price {price!r}")
+            continue
+        if not math.isfinite(usable) or usable <= 0:
+            print(f"#{oid} {snapshot['symbol']}: unusable price {price!r}")
+            continue
+        price = usable
         should_fill, updates, description = _pending_order_decision(snapshot, price)
         with writing(conn):
             row = conn.execute(
@@ -2758,6 +3209,7 @@ def tick(conn, price_fn=None):
                     current["side"],
                     current["qty"],
                     price,
+                    order_id=oid,
                 )
             except SystemExit as exc:
                 reason = str(exc)
@@ -2836,11 +3288,20 @@ def _position_qty_before(conn, account, symbol, action_date):
     return qty
 
 
+def _replay_actions(conn, account):
+    """Corporate actions already applied, as (date, symbol, kind, value, cash_effect)."""
+    return conn.execute(
+        "SELECT action_date, symbol, kind, value, cash_effect FROM corporate_actions"
+        " WHERE account=? ORDER BY action_date",
+        (account,),
+    ).fetchall()
+
+
 def sync_corporate_actions(
-    conn, account=None, actions_fn=_fetch_corporate_actions, source="cli"
+    conn, account=None, actions_fn=_fetch_corporate_actions, source="cli", request_id=None
 ):
     """Apply previously unseen stock/ETF dividends and splits exactly once."""
-    source, _ = _context(source)
+    source, request_id = _context(source, request_id)
     params = (account,) if account else ()
     where = "AND p.account=?" if account else ""
     rows = conn.execute(
@@ -2902,10 +3363,24 @@ def sync_corporate_actions(
                     continue
                 cash_effect = 0.0
                 if kind == "split":
+                    # Only shares held on the ex-date are split; anything traded since
+                    # keeps its quantity. Applying the ratio to the whole current
+                    # position would disagree with the point-in-time equity_curve replay.
+                    row = conn.execute(
+                        "SELECT qty,avg_cost FROM positions WHERE account=? AND symbol=?",
+                        (name, symbol),
+                    ).fetchone()
+                    if not row or row[0] == 0:
+                        continue
+                    held_now, avg_now = row[0], row[1]
+                    shares_at_ex = _position_qty_before(conn, name, symbol, action_date)
+                    post = held_now + shares_at_ex * (value - 1)
+                    if abs(post) < 1e-9:
+                        continue
+                    basis = held_now * avg_now
                     conn.execute(
-                        "UPDATE positions SET qty=qty*?,avg_cost=avg_cost/?"
-                        " WHERE account=? AND symbol=?",
-                        (value, value, name, symbol),
+                        "UPDATE positions SET qty=?,avg_cost=? WHERE account=? AND symbol=?",
+                        (post, basis / post, name, symbol),
                     )
                 elif kind == "dividend":
                     qty = _position_qty_before(conn, name, symbol, action_date)
@@ -3014,6 +3489,12 @@ def create_watchlist(conn, account, name, symbols=None, source="cli", request_id
             row = conn.execute(
                 "SELECT id FROM watchlists WHERE account=? AND name=?", (account, name)
             ).fetchone()
+            if row is None:
+                # Watchlist was deleted after the audit row was written.
+                raise SystemExit(
+                    f"idempotency key '{request_id}' was used before, but watchlist "
+                    f"'{name}' no longer exists (it was deleted)"
+                )
             print(f"idempotent replay: watchlist {name}")
             return row[0]
         if not conn.execute(
@@ -3429,7 +3910,10 @@ def export_history(conn, account, limit=5000, fmt="csv"):
     df = __import__("pandas").DataFrame(rows, columns=cols)
     import io
     buf = io.BytesIO()
-    df.to_parquet(buf, index=False)
+    try:
+        df.to_parquet(buf, index=False)
+    except ImportError:
+        raise SystemExit("parquet export requires: pip install pyarrow pandas")
     return buf.getvalue()
 
 def import_history(conn, account, data: bytes, fmt="csv", source="cli", request_id=None):
@@ -3445,23 +3929,94 @@ def import_history(conn, account, data: bytes, fmt="csv", source="cli", request_
             import pandas as pd, io
         except ImportError:
             raise SystemExit("parquet import requires: pip install pyarrow pandas")
-        df = __import__("pandas").read_parquet(io.BytesIO(data) if isinstance(data, bytes) else io.StringIO(data))
+        try:
+            df = __import__("pandas").read_parquet(io.BytesIO(data) if isinstance(data, bytes) else io.StringIO(data))
+        except ImportError:
+            raise SystemExit("parquet import requires: pip install pyarrow pandas")
         rows = df.to_dict(orient="records")
     else:
         raise SystemExit("format must be csv or parquet")
     count = 0
+    skipped = []
     with writing(conn):
-        for r in rows:
+        for index, r in enumerate(rows):
             try:
                 conn.execute(
                     "INSERT INTO orders(account,symbol,side,qty,limit_price,status,filled_price,ts,source,request_id,order_type,stop_price,trail_price,trail_percent,time_in_force,extended_hours,notional,client_order_id,parent_id,order_class) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (account, r.get("symbol",""), r.get("side","buy"), float(r.get("qty",0) or 0), r.get("limit_price"), r.get("status","imported"), r.get("filled_price"), r.get("ts") or __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(), source, request_id, r.get("order_type","market"), r.get("stop_price"), r.get("trail_price"), r.get("trail_percent"), r.get("time_in_force","gtc"), int(bool(r.get("extended_hours"))), r.get("notional"), r.get("client_order_id"), r.get("parent_id"), r.get("order_class","simple"))
+                    (
+                        account,
+                        _clean_text(r, ("symbol",), ""),
+                        _clean_text(r, ("side",), "buy"),
+                        _clean_float(r, ("qty", "quantity"), 0.0),
+                        _clean_float(r, ("limit_price",), None),
+                        _clean_text(r, ("status",), "imported"),
+                        _clean_float(r, ("filled_price",), None),
+                        _clean_text(r, ("ts", "timestamp"), "")
+                        or __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+                        source,
+                        request_id,
+                        _clean_text(r, ("order_type",), "market"),
+                        _clean_float(r, ("stop_price",), None),
+                        _clean_float(r, ("trail_price",), None),
+                        _clean_float(r, ("trail_percent",), None),
+                        _clean_text(r, ("time_in_force",), "gtc"),
+                        int(_clean_bool(r, ("extended_hours",))),
+                        _clean_float(r, ("notional",), None),
+                        # Empty string would collide with the partial unique index on client_order_id.
+                        _clean_text(r, ("client_order_id",), None),
+                        _clean_int(r, ("parent_id",), None),
+                        _clean_text(r, ("order_class",), "simple"),
+                    ),
                 )
                 count += 1
-            except Exception:
-                continue
+            except Exception as exc:
+                skipped.append(f"row {index + 2}: {exc}")
+    if skipped:
+        print(f"skipped {len(skipped)} row(s): {skipped[0]}", file=sys.stderr)
     print(f"imported {count} orders into '{account}'")
     return count
+
+
+def _clean_text(row, keys, default):
+    """First non-empty string among keys; empty/None become default."""
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in ("nan", "none", "null"):
+            return text
+    return default
+
+
+def _clean_float(row, keys, default):
+    """First finite float among keys; blank/NaN/unparseable become default (None stays NULL)."""
+    for key in keys:
+        value = row.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            return number
+    return default
+
+
+def _clean_int(row, keys, default):
+    number = _clean_float(row, keys, None)
+    return int(number) if number is not None else default
+
+
+def _clean_bool(row, keys):
+    """CSV '0'/'False' must read as False — bool(str) would make them True."""
+    value = _clean_text(row, keys, "")
+    if not value:
+        return False
+    return value.strip().lower() not in ("0", "false", "no", "off")
 
 def audit_events(conn, account=None, limit=100, offset=0):
     limit = max(1, min(int(limit), 500))
@@ -3772,6 +4327,34 @@ def current_equity(conn, account, price_fn=None):
     return eq
 
 
+def _apply_action(state, payload, deferred):
+    """Apply a corporate action to the replay state.
+
+    Returns True when applied. An action whose symbol has no open position in the replay
+    (its ex-date sorts before same-day fills) is parked in `deferred` for a later retry.
+    Dividends credit their recorded cash_effect rather than recomputing it, so the curve
+    matches the live account exactly and the dividend is never counted twice.
+    """
+    sym, action_kind, value, cash_effect = payload
+    held = state["pos"].get(sym)
+    if action_kind == "split":
+        if not held:
+            deferred.append(payload)
+            return False
+        if value > 0:
+            held["qty"] *= value
+            held["avg"] /= value
+            held["margin"] *= value
+    elif action_kind == "dividend":
+        if not held:
+            deferred.append(payload)
+            return False
+        amount = cash_effect if cash_effect is not None else held["qty"] * value
+        state["cash"] += amount
+        state["realized"] += amount
+    return True
+
+
 def equity_curve(
     conn, account, closes_fn=_daily_closes, live=False, with_cashflows=False
 ):
@@ -3790,17 +4373,50 @@ def equity_curve(
         " AND filled_price IS NOT NULL ORDER BY ts",
         (account,),
     ).fetchall()
-    stamps = [r[0] for r in flows] + [r[0] for r in trades]
+    # Splits and dividends mutate positions/cash outside the order ledger, so the replay
+    # must include them or the curve disagrees with the live account.
+    actions = conn.execute(
+        "SELECT action_date, symbol, kind, value, cash_effect FROM corporate_actions"
+        " WHERE account=? ORDER BY action_date",
+        (account,),
+    ).fetchall()
+    # Borrow is an internal cost, not an external flow: replay it so the curve matches the
+    # ledger, but never hand it to performance_metrics as a cashflow.
+    borrows = [
+        (ts, amount)
+        for action, ts, amount in conn.execute(
+            "SELECT action,ts, json_extract(details,'$.amount') FROM audit_log"
+            " WHERE account=? AND action IN ('borrow.charge','margin.call')",
+            (account,),
+        )
+        if amount is not None
+    ]
+    stamps = (
+        [r[0] for r in flows]
+        + [r[0] for r in trades]
+        + [r[0] for r in actions]
+        + [r[0] for r in borrows]
+    )
     if not stamps:
         return ([], flows) if with_cashflows else []
     start, end = min(stamps)[:10], datetime.now().strftime("%Y-%m-%d")
     closes = closes_fn(sorted({t[1] for t in trades}), start, end)
     events = sorted(
         [(f[0], "cash", f[1]) for f in flows]
-        + [(t[0], "trade", t[1:]) for t in trades],
+        + [(t[0], "trade", t[1:]) for t in trades]
+        + [(a[0], "action", a[1:]) for a in actions]
+        + [(b[0], "cost", b[1]) for b in borrows],
         key=lambda e: e[0],
     )
     state = {"cash": 0.0, "realized": 0.0, "pos": {}}
+    # Fills apply commission/slippage as cash drag (_fill_locked); the replay must use the
+    # same effective price or the curve overstates equity by the total costs paid.
+    try:
+        rl = risk_limits(conn, account)
+    except SystemExit:
+        rl = {}
+    extra_bps = (rl.get("commission_bps", 0) or 0) + (rl.get("slippage_bps", 0) or 0)
+    deferred_actions = []
     last_close, curve, ei = {}, [], 0
     day, d_end = _dt.date.fromisoformat(start), _dt.date.fromisoformat(end)
     while day <= d_end:
@@ -3809,12 +4425,26 @@ def equity_curve(
             _, kind, payload = events[ei]
             if kind == "cash":
                 state["cash"] += payload
+            elif kind == "action":
+                _apply_action(state, payload, deferred_actions)
+            elif kind == "cost":
+                state["cash"] -= payload
+                state["realized"] -= payload
             else:
                 sym, side, q, fp = payload
+                effective = fp * (1 + extra_bps / 10000) if side == "buy" else fp * (1 - extra_bps / 10000)
                 try:
-                    _apply(state, sym, side, q, fp)
+                    _apply(state, sym, side, q, effective)
                 except SystemExit:
                     pass  # a same-day flow may not have landed yet in replay; skip
+                # A corporate action dated the same day sorts before its ISO-dated fills
+                # ("2026-01-02" < "2026-01-02T15:00:00Z"); retry it now the position exists.
+                if deferred_actions:
+                    still_pending = []
+                    for held_payload in deferred_actions:
+                        if not _apply_action(state, held_payload, []):
+                            still_pending.append(held_payload)
+                    deferred_actions = still_pending
             ei += 1
         for sym, hd in closes.items():
             if ds in hd:
@@ -4784,22 +5414,27 @@ def _run_cli(args):
                     print(f"wrote {len(data)} bytes to {out}")
                 else:
                     # Write to stdout as base64 for CLI --json mode? For raw, write bytes
-                    import sys, base64
+                    import base64
                     # If stdout is tty, write file; else write bytes
                     if sys.stdout.isatty():
                         print(f"parquet {len(data)} bytes (use --output to write file)")
                     else:
                         sys.stdout.buffer.write(data)
             else:
-                print(
-                    trade_history_csv(
-                        conn, account, args.limit
-                    ),
-                    end="",
+                csv_text = trade_history_csv(
+                    conn, account, args.limit
                 )
+                if out:
+                    open(out, "w").write(csv_text)
+                    print(f"wrote {len(csv_text)} chars to {out}")
+                else:
+                    print(csv_text, end="")
         elif args.cmd == "import":
             fmt = args.format or ("parquet" if args.file.endswith(".parquet") else "csv")
-            data = open(args.file, "rb").read()
+            try:
+                data = open(args.file, "rb").read()
+            except OSError:
+                raise SystemExit(f"cannot read import file '{args.file}'")
             # Decode if csv
             if fmt == "csv":
                 data = data.decode()

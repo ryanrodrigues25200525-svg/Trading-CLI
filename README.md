@@ -42,8 +42,8 @@ python3 papertrade.py market --json
 # Alpaca-style order lifecycle
 python3 papertrade.py order submit AAPL --side buy --qty 10 --type limit --limit-price 185 -a mybook
 python3 papertrade.py order submit AAPL --side sell --qty 10 --type trailing-stop --trail-percent 3 -a mybook
-python3 papertrade.py order get --order-id 1 --json
-python3 papertrade.py order replace 1 --limit-price 184
+python3 papertrade.py order get --order-id 2 --json   # pending limit from above
+python3 papertrade.py order replace 2 --limit-price 184
 python3 papertrade.py order cancel-all -a mybook
 python3 papertrade.py order submit AAPL --side buy --qty 10 --type limit --limit-price 180 --dry-run --json
 python3 papertrade.py position close AAPL --percent 50 -a mybook

@@ -84,6 +84,12 @@ def braille_chart(values, width=74, height=16):
     """Line chart in braille dots. Returns list of strings (rows)."""
     if len(values) < 2:
         return ["(not enough history yet)"]
+    # Drop non-finite points; a single NaN/inf would poison min/max and raise here.
+    import math as _math
+
+    values = [v for v in values if isinstance(v, (int, float)) and _math.isfinite(v)]
+    if len(values) < 2:
+        return ["(not enough finite history yet)"]
     lo, hi = min(values), max(values)
     if hi == lo:
         hi = lo + 1
@@ -116,16 +122,27 @@ def _pct(frac):
     return f"[{c}]{frac * 100:+.2f}%[/{c}]"
 
 
+def _num(value, pattern=".2f"):
+    """Format a possibly-NULL numeric field (imported rows can omit it)."""
+    return "—" if value is None else f"{value:{pattern}}"
+
+
 def _pending_order_label(order):
     oid, side, qty, symbol, kind, limit, stop, trail, trail_pct, tif = order
     if kind == "limit":
-        trigger = f"lim {limit:.2f}"
+        trigger = f"lim {_num(limit)}"
     elif kind == "stop":
-        trigger = f"stop {stop:.2f}"
+        trigger = f"stop {_num(stop)}"
     elif kind == "stop_limit":
-        trigger = f"stop {stop:.2f} / lim {limit:.2f}"
+        trigger = f"stop {_num(stop)} / lim {_num(limit)}"
     elif kind == "trailing_stop":
-        configured = f"{trail:.2f}" if trail is not None else f"{trail_pct:.2f}%"
+        configured = (
+            f"{trail:.2f}"
+            if trail is not None
+            else f"{trail_pct:.2f}%"
+            if trail_pct is not None
+            else "unset"
+        )
         trigger = f"trail {configured}"
         if stop is not None:
             trigger += f" (stop {stop:.2f})"
@@ -496,7 +513,10 @@ def prompt_rename(console):
 def _display_number(value, pattern=".2f", suffix=""):
     if value is None:
         return "—"
-    return f"{value:{pattern}}{suffix}"
+    try:
+        return f"{value:{pattern}}{suffix}"
+    except (TypeError, ValueError):
+        return "—"
 
 
 def _chart_group(values, color, width=36, height=9):
@@ -568,7 +588,8 @@ def backtesting_graphs_view(account, current_curve, backtest, current_metrics=No
         backtest_stats.add_column(ratio=1)
         backtest_stats.add_row(
             "[dim]EQUITY[/dim]\n[bold]"
-            f"{metrics['initial_equity']:,.0f} → {metrics['final_equity']:,.0f}[/bold]",
+            f"{_display_number(metrics['initial_equity'], ',.0f')} → "
+            f"{_display_number(metrics['final_equity'], ',.0f')}[/bold]",
             "[dim]RETURN[/dim]\n[bold]"
             f"{_display_number(metrics['return_pct'], '+.2f', '%')}[/bold]",
         )
