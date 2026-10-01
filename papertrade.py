@@ -4677,7 +4677,7 @@ def _pkg_version():
         from importlib.metadata import version as _v
         return _v("tradingcli")
     except Exception:
-        return "0.4.0"
+        return "0.4.1"
 
 __version__ = _pkg_version()
 
