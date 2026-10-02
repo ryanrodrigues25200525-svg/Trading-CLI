@@ -1,4 +1,4 @@
-# tradingcli
+# Trading CLI
 
 Local, multi-account paper-trading CLI, live terminal dashboard, REST + MCP server. SQLite state, Yahoo Finance market data. Simulation only — never places live brokerage orders.
 
@@ -103,7 +103,7 @@ tradingcli-mcp
   "mcpServers": {
     "papertrade": {
       "command": "python3",
-      "args": ["/absolute/path/to/tradingcli/mcp_server.py"],
+      "args": ["/absolute/path/to/Trading-CLI/mcp_server.py"],
       "env": { "PAPERTRADE_MCP_PROFILE": "core" }
     }
   }
