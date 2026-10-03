@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tradingcli"
-version = "0.5.1"
+version = "0.5.2"
 description = "Local multi-account paper-trading CLI, live TUI dashboard, REST + MCP server"
 readme = "README.md"
 requires-python = ">=3.10"

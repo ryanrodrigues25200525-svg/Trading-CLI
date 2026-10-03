@@ -6,6 +6,14 @@ All notable changes to tradingcli are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-10-04
+
+### Changed
+
+- README readability pass (emoji section headers, grouped commands) and
+  corrected MCP tool counts (60 / 72 / 79) plus the missing
+  `test_quote_cache.py` entry. No code changes since 0.5.1.
+
 ## [0.5.1] — 2026-10-03
 
 ### Added
