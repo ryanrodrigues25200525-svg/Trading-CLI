@@ -18,3 +18,7 @@ venv/
 
 # Isolated git worktrees (superpowers SDD)
 .worktrees/
+
+# Bun / Node artifacts (tradingcli-tui sidecar; regenerate via `bun install`)
+node_modules/
+tui/dist/
