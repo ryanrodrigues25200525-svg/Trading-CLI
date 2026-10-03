@@ -12,7 +12,7 @@ import { loadSnapshot, type DashboardSnapshot } from "../store";
 import type { EngineOpts, SpawnFn } from "../types";
 import { BacktestPrompt, BacktestView, type BacktestData } from "./BacktestView";
 import { OrderModal, needsFirstRun, type OrderModalKind } from "./OrderModal";
-import { PortfolioPanels } from "./PortfolioPanels";
+import { PortfolioPanels, YELLOW } from "./PortfolioPanels";
 import { LOGO, StatusBar } from "./StatusBar";
 
 export type ModalState =
@@ -91,8 +91,9 @@ export function App({
       }
       prevRef.current = merged;
       setSnap(next);
-      // A failed auto-tick shows alongside the panels (snapshot still rendered).
-      setError(next.tickError);
+      // A successful refresh clears hard errors. A failed auto-tick does not
+      // raise here — it rides along on the snapshot as a subtle notice below.
+      setError(null);
     } catch (e) {
       const message = e instanceof EngineError ? e.message : String(e);
       setError(message); // keep the last good frame underneath
@@ -213,6 +214,9 @@ export function App({
       ) : (
         <box flexDirection="column">
           <StatusBar clock={snap.clock} asOf={snap.asOf} />
+          {snap.tickError !== null ? (
+            <text fg={YELLOW}>◌ {shortError(snap.tickError)}</text>
+          ) : null}
           <PortfolioPanels panels={snap.panels} />
         </box>
       )}

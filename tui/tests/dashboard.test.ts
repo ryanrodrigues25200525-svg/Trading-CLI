@@ -3,9 +3,9 @@ import { describe, expect, test } from "bun:test";
 import { createElement } from "react";
 import { testRender } from "@opentui/react/test-utils";
 import { loadSnapshot, pendingOrderLabel } from "../src/store";
-import { shortError } from "../src/views/App";
+import { App, shortError } from "../src/views/App";
 import { gainFg, sideSeg, signedSeg, tickSeg } from "../src/views/PortfolioPanels";
-import type { AccountPanel } from "../src/store";
+import type { AccountPanel, DashboardSnapshot } from "../src/store";
 import { parseArgs, ttyGuardMessage } from "../src/index";
 import { PortfolioPanels } from "../src/views/PortfolioPanels";
 import { StatusBar } from "../src/views/StatusBar";
@@ -367,8 +367,7 @@ describe("shortError (engine error display)", () => {
   });
 });
 
-describe("panel colors", () => {
-  test("gains green, losses red, zero counts as gain", () => {
+describe("panel colors", () => {  test("gains green, losses red, zero counts as gain", () => {
     expect(gainFg(1.5)).toBe("green");
     expect(gainFg(-0.01)).toBe("#ff2b4a");
     expect(gainFg(0)).toBe("green");
@@ -560,5 +559,52 @@ describe("quote cache (Yahoo rate-limit)", () => {
     expect(counts.ticks).toBe(1);
     await loadSnapshot({ spawn, nowMs: 1_000_000 + 61_000 });
     expect(counts.ticks).toBe(2);
+  });
+});
+
+describe("app error display", () => {
+  const emptySnap = (tickError: string | null): DashboardSnapshot => ({
+    panels: [],
+    quotes: {},
+    clock: { isOpen: false, transition: "open", eastern: "" },
+    pending: [],
+    asOf: "00:00:00",
+    tickError,
+  });
+
+  test("transient tick notice renders subtle, without the red error box", async () => {
+    const setup = await testRender(
+      createElement(App, {
+        loader: async () =>
+          emptySnap("YFRateLimitError: Too Many Requests. Rate limited."),
+        checkFirstRun: async () => false,
+      }),
+      { width: 120, height: 20 },
+    );
+    try {
+      const frame = await setup.waitForFrame((f) => f.includes("rate-limiting"));
+      expect(frame).not.toContain("engine error");
+      expect(frame).toContain("◌");
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
+
+  test("hard refresh failure still shows the red error box", async () => {
+    const setup = await testRender(
+      createElement(App, {
+        loader: async () => {
+          throw new Error("no account 'ghost'");
+        },
+        checkFirstRun: async () => false,
+      }),
+      { width: 120, height: 20 },
+    );
+    try {
+      const frame = await setup.waitForFrame((f) => f.includes("engine error"));
+      expect(frame).toContain("no account");
+    } finally {
+      setup.renderer.destroy();
+    }
   });
 });
