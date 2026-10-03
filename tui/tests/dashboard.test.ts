@@ -7,7 +7,7 @@ import { App, shortError } from "../src/views/App";
 import { gainFg, sideSeg, signedSeg, tickSeg } from "../src/views/PortfolioPanels";
 import type { AccountPanel, DashboardSnapshot } from "../src/store";
 import { parseArgs, ttyGuardMessage } from "../src/index";
-import { PortfolioPanels } from "../src/views/PortfolioPanels";
+import { AccountPanelView, PortfolioPanels } from "../src/views/PortfolioPanels";
 import { StatusBar } from "../src/views/StatusBar";
 import type { SpawnFn } from "../src/types";
 
@@ -624,6 +624,55 @@ describe("app error display", () => {
       expect(frame).toContain("no account");
     } finally {
       setup.renderer.destroy();
+    }
+  });
+});
+
+describe("panel scale", () => {
+  test("50-row book renders every row with no overflow", async () => {
+    const positions = Array.from({ length: 50 }, (_, i) => ({
+      symbol: `SYM${String(i).padStart(2, "0")}`,
+      long: true,
+      qty: i + 1,
+      avgCost: 100,
+      mult: 1,
+      assetClass: "spot",
+      price: 101,
+      prevClose: 100,
+      marketValue: (i + 1) * 101,
+      costBasis: (i + 1) * 100,
+      unreal: i + 1,
+      pct: 1.0,
+      tickmark: "▲" as const,
+      outage: false,
+    }));
+    const big: AccountPanel = {
+      name: "big",
+      cash: 1000,
+      deposits: 100000,
+      realized: 0,
+      equity: 200000,
+      day: 10,
+      unreal: 500,
+      total: 500,
+      retPct: 0.5,
+      isDefault: false,
+      positions,
+      pending: [],
+    };
+    for (const width of [110, 80, 40]) {
+      const setup = await testRender(createElement(AccountPanelView, { panel: big }), {
+        width,
+        height: 70,
+      });
+      try {
+        const frame = await setup.waitForFrame((f) => f.includes("SYM49"));
+        const rows = frame.split("\n").filter((l) => l.includes("SYM"));
+        expect(rows.length).toBe(51); // header + 50 rows
+        for (const l of frame.split("\n")) expect(l.length).toBeLessThanOrEqual(width);
+      } finally {
+        setup.renderer.destroy();
+      }
     }
   });
 });

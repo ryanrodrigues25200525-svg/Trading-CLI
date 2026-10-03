@@ -13,7 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import papertrade as pt
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:  # mcp>=2 renamed FastMCP to MCPServer (same tool/run surface)
+    from mcp.server.mcpserver import MCPServer as FastMCP
 
 mcp = FastMCP("papertrade")
 

@@ -14,8 +14,9 @@ import mcp_server as server
 
 
 async def invoke(name, arguments=None):
+    # context=None works on mcp 1.x (default) and 2.x (required positional).
     return await server.mcp._tool_manager._tools[name].run(
-        arguments or {}, convert_result=False
+        arguments or {}, None, convert_result=False
     )
 
 
