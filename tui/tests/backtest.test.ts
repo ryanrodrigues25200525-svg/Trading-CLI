@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { createElement } from "react";
 import { testRender } from "@opentui/react/test-utils";
 import {
+  BacktestPrompt,
   BacktestView,
   backtestLines,
   openBacktest,
@@ -138,6 +139,28 @@ describe("backtest view", () => {
       setup.renderer.destroy();
     }
     expect(closed).toBe(1);
+  });
+
+  test("q closes the backtest prompt", async () => {
+    let closed = 0;
+    let picked = 0;
+    const setup = await testRender(
+      createElement(BacktestPrompt, {
+        defaultAccount: "main",
+        onClose: () => closed++,
+        onPick: () => picked++,
+      }),
+      { width: 100, height: 20 },
+    );
+    try {
+      await setup.waitForFrame((f) => f.includes("Backtesting"));
+      await setup.mockInput.pressKeys(["q"]);
+      await setup.flush();
+      expect(closed).toBe(1);
+      expect(picked).toBe(0);
+    } finally {
+      setup.renderer.destroy();
+    }
   });
 
   test("parseLookbackDays mirrors parse_lookback_days presets + errors", async () => {

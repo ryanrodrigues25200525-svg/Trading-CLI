@@ -12,6 +12,7 @@ import { useKeyboard } from "@opentui/react";
 import { backtest, equityCurve, runCli } from "../engine";
 import type { EngineOpts } from "../types";
 import { brailleChart } from "../chart";
+import { engineMessage } from "./OrderModal";
 
 /** Mirrors portfolio_backtest.LOOKBACK_PRESETS (calendar days). */
 export const LOOKBACK_PRESETS: Record<string, number> = {
@@ -253,7 +254,7 @@ export function BacktestPrompt({
 
   useKeyboard((key) => {
     if (busy) return;
-    if (key.name === "escape") onClose();
+    if (key.name === "escape" || key.name === "q") onClose();
     else if (key.name === "tab") setActive((i) => (i + 1) % 2);
   });
 
@@ -275,7 +276,7 @@ export function BacktestPrompt({
         loader ?? ((a: string, preset: string) => openBacktest(a, preset, { spawn }));
       onPick(await load(account.trim(), history));
     } catch (e) {
-      setError(e instanceof Error ? e.message.replace(/^.*?: /, "") : String(e));
+      setError(engineMessage(e));
     } finally {
       setBusy(false);
     }

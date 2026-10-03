@@ -5,6 +5,7 @@ import { testRender } from "@opentui/react/test-utils";
 import {
   buildModalArgs,
   emptyFields,
+  engineMessage,
   needsFirstRun,
   submitModal,
   validateFields,
@@ -12,6 +13,7 @@ import {
   type ModalFields,
   type SubmitDeps,
 } from "../src/views/OrderModal";
+import { EngineError } from "../src/engine";
 import type { SpawnFn } from "../src/types";
 
 function depsWith(calls: { runs: string[][]; resnapshots: number }): SubmitDeps {
@@ -82,6 +84,68 @@ describe("modals", () => {
     // Exactly one mutation CLI call, then exactly one re-snapshot (no sleep/tick).
     expect(calls.runs).toEqual([["buy", "AAPL", "10", "-a", "main"]]);
     expect(calls.resnapshots).toBe(1);
+  });
+
+  test("blank qty/strike/contracts rejected with zero CLI calls", async () => {
+    const buy: ModalFields = {
+      ...emptyFields(),
+      account: "main",
+      symbol: "AAPL",
+      qty: "   ",
+      limit: "",
+    };
+    expect(validateFields("buy", buy)).toBe("not a number, aborted");
+    expect(validateFields("sell", { ...buy, qty: "" })).toBe("not a number, aborted");
+    const optBase: ModalFields = {
+      ...emptyFields(),
+      account: "main",
+      side: "buy",
+      underlying: "AAPL",
+      expiry: "2026-12-18",
+      optionKind: "C",
+      strike: "",
+      contracts: "1",
+      limit: "",
+    };
+    expect(validateFields("option", optBase)).toBe("not a number, aborted");
+    expect(validateFields("option", { ...optBase, strike: "150", contracts: "" })).toBe(
+      "not a number, aborted",
+    );
+    const calls = { runs: [] as string[][], resnapshots: 0 };
+    const result = await submitModal("buy", buy, depsWith(calls));
+    expect(result).toEqual({ ok: false, error: "not a number, aborted" });
+    expect(calls.runs).toEqual([]);
+    expect(calls.resnapshots).toBe(0);
+    // buildModalArgs never emits String(null): garbage throws instead.
+    expect(() => buildModalArgs("buy", { ...buy, qty: "abc" })).toThrow(
+      "not a number, aborted",
+    );
+    expect(() => buildModalArgs("sell", { ...buy, qty: "" })).toThrow(
+      "not a number, aborted",
+    );
+  });
+
+  test("colon-bearing engine message preserved inline", async () => {
+    const fields: ModalFields = {
+      ...emptyFields(),
+      account: "main",
+      symbol: "AAPL",
+      qty: "10",
+      limit: "",
+    };
+    const failing: SubmitDeps = {
+      run: async () => {
+        throw new EngineError("rejected at 10:30: limit 5", "papertrade.py buy");
+      },
+      resnapshot: async () => {},
+    };
+    const result = await submitModal("buy", fields, failing);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("rejected at 10:30: limit 5");
+    // Only a leading class prefix is stripped; interior colons survive.
+    expect(engineMessage(new Error("a: b: c"))).toBe("a: b: c");
+    expect(engineMessage(new Error("Error: keep me"))).toBe("keep me");
+    expect(engineMessage("raw string")).toBe("raw string");
   });
 
   test("cancel passes only the order id (no -a flag)", async () => {

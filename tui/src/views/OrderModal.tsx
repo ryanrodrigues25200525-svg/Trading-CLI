@@ -93,6 +93,18 @@ function badNumber(raw: string): boolean {
   return Number.isNaN(parseNum(raw));
 }
 
+/** Required numeric field: blank is invalid (blank `limit` stays "market"). */
+function blankOrBad(raw: string): boolean {
+  return raw.trim() === "" || badNumber(raw);
+}
+
+/** Validated number for argv building; throws instead of emitting "null". */
+function reqNum(raw: string): number {
+  const n = parseNum(raw);
+  if (n === null || Number.isNaN(n)) throw new Error("not a number, aborted");
+  return n;
+}
+
 /** TS port of papertrade.build_occ validation (same messages, same order). */
 function checkOccParts(
   underlying: string,
@@ -129,7 +141,7 @@ export function validateFields(kind: OrderModalKind, f: ModalFields): string | n
     case "sell": {
       if (!f.account.trim()) return "account is required";
       if (!f.symbol.trim()) return "symbol is required";
-      if (badNumber(f.qty)) return "not a number, aborted";
+      if (blankOrBad(f.qty)) return "not a number, aborted";
       if (f.limit.trim() !== "" && badNumber(f.limit)) return "not a number, aborted";
       return null;
     }
@@ -145,7 +157,9 @@ export function validateFields(kind: OrderModalKind, f: ModalFields): string | n
       ) {
         return "missing/invalid fields, aborted";
       }
-      if (badNumber(f.strike) || badNumber(f.contracts)) return "not a number, aborted";
+      if (blankOrBad(f.strike) || blankOrBad(f.contracts)) {
+        return "not a number, aborted";
+      }
       if (f.limit.trim() !== "" && badNumber(f.limit)) return "not a number, aborted";
       return checkOccParts(
         f.underlying,
@@ -194,9 +208,8 @@ export function buildModalArgs(kind: OrderModalKind, f: ModalFields): string[][]
   switch (kind) {
     case "buy":
     case "sell": {
-      const qty = String(parseNum(f.qty));
-      const argv = [kind, f.symbol.trim().toUpperCase(), qty, "-a", f.account.trim()];
-      if (f.limit.trim() !== "") argv.push("--limit", String(parseNum(f.limit)));
+      const argv = [kind, f.symbol.trim().toUpperCase(), String(reqNum(f.qty)), "-a", f.account.trim()];
+      if (f.limit.trim() !== "") argv.push("--limit", String(reqNum(f.limit)));
       return [argv];
     }
     case "option": {
@@ -206,18 +219,18 @@ export function buildModalArgs(kind: OrderModalKind, f: ModalFields): string[][]
         f.underlying.trim().toUpperCase(),
         f.expiry.trim(),
         f.optionKind.trim().toUpperCase(),
-        String(parseNum(f.strike)),
-        String(parseNum(f.contracts)),
+        String(reqNum(f.strike)),
+        String(reqNum(f.contracts)),
         "-a",
         f.account.trim(),
       ];
-      if (f.limit.trim() !== "") argv.push("--limit", String(parseNum(f.limit)));
+      if (f.limit.trim() !== "") argv.push("--limit", String(reqNum(f.limit)));
       return [argv];
     }
     case "cancel":
       return [["order", "cancel", stripHash(f.orderId.trim())]];
     case "new": {
-      const cash = f.cash.trim() === "" ? 100_000 : (parseNum(f.cash) as number);
+      const cash = f.cash.trim() === "" ? 100_000 : reqNum(f.cash);
       return [["new", f.name.trim(), "--cash", String(cash)]];
     }
     case "rename":
@@ -226,7 +239,7 @@ export function buildModalArgs(kind: OrderModalKind, f: ModalFields): string[][]
       return [["use", f.name.trim()]];
     case "setup": {
       const name = f.name.trim() || "main";
-      const cash = f.cash.trim() === "" ? 100_000 : (parseNum(f.cash) as number);
+      const cash = f.cash.trim() === "" ? 100_000 : reqNum(f.cash);
       const profile = f.profile.trim().toLowerCase();
       const seq: string[][] = [["new", name, "--cash", String(cash)]];
       if (profile === "conservative") {
@@ -266,8 +279,14 @@ export interface SubmitDeps {
 
 export type SubmitResult = { ok: true } | { ok: false; error: string };
 
-function engineMessage(e: unknown): string {
-  return e instanceof Error ? e.message.replace(/^.*?: /, "") : String(e);
+/**
+ * Inline engine-failure text. Leaves `Error.message` intact except for a
+ * leading `EngineError: `/`Error: ` class prefix — never strip on `: `,
+ * which would mangle messages that themselves contain colons.
+ */
+export function engineMessage(e: unknown): string {
+  if (e instanceof Error) return e.message.replace(/^(EngineError|Error): /, "");
+  return String(e);
 }
 
 /**
