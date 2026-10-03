@@ -25,6 +25,9 @@ All notable changes to tradingcli are documented here. Format follows
 
 - TUI display quotes are 15-minute delayed (`QUOTE_TTL_MS`); failed auto-tick
   backs off 60s (manual `t` unaffected).
+- TUI refresh economy: single meta round, quotes fetched once per refresh,
+  retick only on fills, 60s market-clock cache — steady refresh 22 spawns/6s
+  down to 4 local spawns/1.5s on the live book.
 - TUI snapshot survives tick failure: panels + pending render with a `tickError`
   note instead of a blank error.
 - TUI color (gains/losses/accents, valid greys), airy layout with rules and an
