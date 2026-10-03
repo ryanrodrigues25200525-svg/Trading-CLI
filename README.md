@@ -12,6 +12,7 @@ Requires Python 3.10+ and Bun >=1.4.1 (the `tradingcli-tui` dashboard runs on Bu
 # from source
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # or: pip install -e .
+(cd tui && bun install)                  # TUI deps (Bun + OpenTUI)
 
 # isolated tool install (uv)
 uv tool install .
@@ -80,7 +81,7 @@ Press `g` in the TUI to open **Backtesting & Graphs** — live equity curve besi
 
 ## Web UI (unsupported)
 
-`web_ui.py` + `static/` are retained in the repo but unsupported and excluded from the wheel — use the TUI, CLI `--json`, or MCP server instead.
+`static/` excluded from the wheel; `web_ui.py` retained but unsupported — use the TUI, CLI `--json`, or MCP server instead.
 
 ## MCP server (for Claude Code / Cursor / Hermes)
 

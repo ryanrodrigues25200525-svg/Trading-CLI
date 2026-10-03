@@ -20,6 +20,7 @@
 - **DB** `PAPERTRADE_DB=:memory:` works for isolated agent tests (in-memory SQLite, no file). `PAPERTRADE_DB=/tmp/x.db` isolates per-agent runs. DB path is re-read on each `pt.db()` call so env changes after import are respected.
 
 - **Python** `>=3.10`. Install: `pip install -r requirements.txt` or `pip install -e .` / `uv tool install .`.
+- **Bun** `>=1.4.1`. Install TUI deps: `(cd tui && bun install)`.
 - **DB** `PAPERTRADE_DB` env var overrides `~/.papertrade.db`. Tests use `tempfile` isolation — never touch the real DB in tests.
 - **SQLite** WAL + `busy_timeout=10s` + `BEGIN IMMEDIATE` (`writing()` context). Multiple agents may share the DB. **Always use `writing(conn)` for mutations.**
 
