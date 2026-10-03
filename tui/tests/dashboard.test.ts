@@ -3,6 +3,8 @@ import { describe, expect, test } from "bun:test";
 import { createElement } from "react";
 import { testRender } from "@opentui/react/test-utils";
 import { loadSnapshot, pendingOrderLabel } from "../src/store";
+import { shortError } from "../src/views/App";
+import { gainFg, sideSeg, signedSeg, tickSeg } from "../src/views/PortfolioPanels";
 import type { AccountPanel } from "../src/store";
 import { parseArgs, ttyGuardMessage } from "../src/index";
 import { PortfolioPanels } from "../src/views/PortfolioPanels";
@@ -332,6 +334,59 @@ describe("dashboard views", () => {
     } finally {
       setup.renderer.destroy();
     }
+  });
+});
+
+describe("shortError (engine error display)", () => {
+  test("single-line errors pass through untouched", () => {
+    expect(shortError("no account 'ghost'")).toBe("no account 'ghost'");
+    expect(shortError("risk rejected: short positions are disabled")).toBe(
+      "risk rejected: short positions are disabled",
+    );
+  });
+
+  test("traceback dumps collapse to the informative last line", () => {
+    const dump = [
+      "papertrade.py tick --json: engine failed (exit 1: *args, **kwargs)",
+      '  File "pt.py", line 506, in _make_request',
+      "    raise CustomError()",
+      "pt.CustomError: something specific broke at the end",
+    ].join("\n");
+    expect(shortError(dump)).toBe("pt.CustomError: something specific broke at the end");
+  });
+
+  test("rate-limit maps to a human sentence", () => {
+    expect(shortError("YFRateLimitError: Too Many Requests. Rate limited.")).toMatch(
+      /rate-limiting quotes/i,
+    );
+    expect(shortError("database is locked")).toMatch(/retrying/i);
+  });
+
+  test("very long lines are capped", () => {
+    expect(shortError(`x: ${"y".repeat(500)}`).length).toBeLessThanOrEqual(210);
+  });
+});
+
+describe("panel colors", () => {
+  test("gains green, losses red, zero counts as gain", () => {
+    expect(gainFg(1.5)).toBe("green");
+    expect(gainFg(-0.01)).toBe("#ff2b4a");
+    expect(gainFg(0)).toBe("green");
+  });
+
+  test("side and tickmark colors", () => {
+    expect(sideSeg(true)).toEqual({ t: "LONG", fg: "green" });
+    expect(sideSeg(false)).toEqual({ t: "SHORT", fg: "#ff2b4a" });
+    expect(tickSeg("▲")).toEqual({ t: "▲", fg: "green" });
+    expect(tickSeg("▼")).toEqual({ t: "▼", fg: "#ff2b4a" });
+    expect(tickSeg("·")).toEqual({ t: "·", fg: "grey35" });
+  });
+
+  test("signed segments carry color, nulls are grey ?", () => {
+    expect(signedSeg(12.5)).toEqual({ t: "+12.50", fg: "green" });
+    expect(signedSeg(-3)).toEqual({ t: "-3.00", fg: "#ff2b4a" });
+    expect(signedSeg(null)).toEqual({ t: "?", fg: "grey35" });
+    expect(signedSeg(8, "%")).toEqual({ t: "+8.00%", fg: "green" });
   });
 });
 

@@ -21,6 +21,25 @@ export type ModalState =
   | { view: "backtest"; data: BacktestData }
   | { view: "setup" };
 
+/**
+ * Collapse a raw engine error for the one-line error panel. Single-line
+ * errors pass through; multi-line dumps (e.g. a yfinance traceback) collapse
+ * to the informative last line; known transient states get a human sentence.
+ */
+export function shortError(message: string): string {
+  const clean = message.trim();
+  if (/YFRateLimitError|Rate limited|Too Many Requests|\b429\b/.test(clean)) {
+    return "Yahoo Finance is rate-limiting quotes — showing last data; pending orders fill when quotes return.";
+  }
+  if (/database is (locked|busy)/i.test(clean)) return "Database busy — retrying…";
+  const lines = clean
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const oneLine = lines.length <= 2 ? clean : (lines[lines.length - 1] ?? clean);
+  return oneLine.length > 210 ? `${oneLine.slice(0, 209)}…` : oneLine;
+}
+
 export interface AppProps {
   account?: string;
   /** Refresh cadence in seconds (mirrors `-n`, default 2.0). */
@@ -183,10 +202,10 @@ export function App({
 
   return (
     <box flexDirection="column">
-      <text>{LOGO}</text>
+      <text fg="#ff2b4a">{LOGO}</text>
       {error !== null ? (
-        <box border borderStyle="single">
-          <text>engine error: {error}</text>
+        <box border borderStyle="single" borderColor="red">
+          <text fg="red">engine error: {shortError(error)}</text>
         </box>
       ) : null}
       {snap === null ? (
