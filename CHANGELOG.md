@@ -16,6 +16,10 @@ All notable changes to tradingcli are documented here. Format follows
 - `test_quote_cache.py` proving delayed reads, TTL expiry, and no stale fills.
 - `Dockerfile` (pinned Python 3.11 + requirements + Bun 1.4.2) — verified by
   build + in-container `--version`, accounts flow, and 60-tool MCP import.
+- MCP SDK compatibility: server imports on both `mcp` 1.x (`FastMCP`) and 2.x
+  (`MCPServer`); dependency floor widened to `mcp>=1.27,<3`. All three MCP
+  suites pass under 1.30 and 2.3.0.
+- 50-row book render test (110/80/40 cols): every row present, no overflow.
 
 ### Changed
 
