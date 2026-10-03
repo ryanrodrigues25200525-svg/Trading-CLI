@@ -1,10 +1,14 @@
-# Trading CLI
+# 📈 Trading CLI
 
-Local, multi-account paper-trading CLI, live terminal dashboard, REST + MCP server. SQLite state, Yahoo Finance market data. Simulation only — never places live brokerage orders.
+> Local, multi-account **paper-trading** engine for humans and AI agents.
+> Live terminal dashboard, Alpaca-style orders, REST + MCP server. SQLite state,
+> Yahoo Finance market data. Simulation only — **never places live brokerage orders**. 🚫💸
 
-Stocks / ETFs / crypto (`BTC-USD`) / FX (`EURUSD=X`) / futures (`ES=F`) / equity options (OCC `AAPL260116C00250000`). Engine supports `market / limit / stop / stop_limit / trailing_stop` plus `bracket / OCO / OTO / mleg` with `take_profit / stop_loss`, notional sizing, client order IDs, TIF (`gtc / day / ioc / fok / opg / cls`), and extended-hours limit orders.
+| 🧺 Assets | 🛠️ Engine |
+|---|---|
+| Stocks / ETFs / crypto (`BTC-USD`) / FX (`EURUSD=X`) / futures (`ES=F`) / equity options (OCC `AAPL260116C00250000`) | `market / limit / stop / stop_limit / trailing_stop` + `bracket / OCO / OTO / mleg` with `take_profit / stop_loss`, notional sizing, client order IDs, TIF (`gtc / day / ioc / fok / opg / cls`), extended-hours limit orders |
 
-## Setup
+## ⚙️ Setup
 
 Requires Python 3.10+ and Bun >=1.4.1 (the `tradingcli-tui` dashboard runs on Bun + OpenTUI).
 
@@ -18,12 +22,12 @@ pip install -r requirements.txt          # or: pip install -e .
 uv tool install .
 ```
 
-Database defaults to `~/.papertrade.db`; override with `PAPERTRADE_DB=/tmp/test.db` or `PAPERTRADE_DB=:memory:` for isolated in-memory tests.
+🗄️ Database defaults to `~/.papertrade.db`; override with `PAPERTRADE_DB=/tmp/test.db` or `PAPERTRADE_DB=:memory:` for isolated in-memory tests.
 
-## Run
+## 🚀 Run
 
 ```bash
-# first-run wizard + live TUI dashboard (Bun + OpenTUI)
+# first-run wizard + live TUI dashboard 🖥️ (Bun + OpenTUI)
 python3 papertrade.py            # or: tradingcli
 # explicit dash
 python3 papertrade.py dash       # or: tradingcli dash (or: tradingcli-tui)
@@ -32,24 +36,31 @@ python3 papertrade.py dash --rich
 ```
 
 ```bash
-# headless snapshot for agents / scripting (single JSON envelope, no TTY)
+# headless snapshot for agents / scripting 🤖 (single JSON envelope, no TTY)
 tradingcli-tui --headless --json snapshot
 tradingcli-tui --headless --json snapshot -a mybook
 tradingcli-tui --headless --json backtest -a mybook --lookback-days 1825
 ```
 
+### 👛 Accounts
+
 ```bash
-# accounts
 python3 papertrade.py new mybook --cash 50000
 python3 papertrade.py accounts --json
 python3 papertrade.py use mybook
+```
 
-# simple trade → inspect
+### 💹 Trade → inspect
+
+```bash
 python3 papertrade.py buy AAPL 5 -a mybook
 python3 papertrade.py positions -a mybook --json
 python3 papertrade.py market --json
+```
 
-# Alpaca-style order lifecycle
+### 🔄 Alpaca-style order lifecycle
+
+```bash
 python3 papertrade.py order submit AAPL --side buy --qty 10 --type limit --limit-price 185 -a mybook
 python3 papertrade.py order submit AAPL --side sell --qty 10 --type trailing-stop --trail-percent 3 -a mybook
 python3 papertrade.py order get --order-id 2 --json   # pending limit from above
@@ -58,7 +69,11 @@ python3 papertrade.py order cancel-all -a mybook
 python3 papertrade.py order submit AAPL --side buy --qty 10 --type limit --limit-price 180 --dry-run --json
 python3 papertrade.py position close AAPL --percent 50 -a mybook
 python3 papertrade.py position close-all -a mybook
+```
 
+### 🧷 Brackets, options, watchlists, research
+
+```bash
 # bracket / OCO / OTO — use --take-profit / --stop-loss / --stop-loss-limit
 # options / chain / watchlists / research
 python3 papertrade.py option get AAPL270115C00100000 --json
@@ -75,22 +90,22 @@ python3 papertrade.py calendar --start 2026-07-01 --end 2026-07-31 --json
 python3 papertrade.py backtest -a mybook --lookback-days 1825 --commission-bps 10 --json
 ```
 
-Every command accepts one automation flag: `--json` / `--csv` / `--quiet`. `--schema` prints the command tree without touching market data; `doctor` checks DB integrity.
+🤖 Every command accepts one automation flag: `--json` / `--csv` / `--quiet`. `--schema` prints the command tree without touching market data; `doctor` checks DB integrity.
 
-Press `g` in the TUI to open **Backtesting & Graphs** — live equity curve beside a `backtesting.py` current-holdings backtest (return, CAGR, vol, Sharpe, Sortino, costs, maxDD). Universe is the selected account's open positions; `6m / 1y / 2y / 5y / 10y / max` presets or exact days. CAGR uses real calendar elapsed time; options appear as `skipped` (no point-in-time chain history); futures use continuous series without roll costs. Curves are time-weighted, so deposits/withdrawals don't masquerade as alpha. The result has intentional look-ahead/survivorship bias — it's a "what if we held today's book" retrospective, not an OOS strategy test. Yahoo adjusted closes are used; crypto top-of-book is indicative.
+Press `g` in the TUI to open **📊 Backtesting & Graphs** — live equity curve beside a `backtesting.py` current-holdings backtest (return, CAGR, vol, Sharpe, Sortino, costs, maxDD). Universe is the selected account's open positions; `6m / 1y / 2y / 5y / 10y / max` presets or exact days. CAGR uses real calendar elapsed time; options appear as `skipped` (no point-in-time chain history); futures use continuous series without roll costs. Curves are time-weighted, so deposits/withdrawals don't masquerade as alpha. The result has intentional look-ahead/survivorship bias — it's a "what if we held today's book" retrospective, not an OOS strategy test. Yahoo adjusted closes are used; crypto top-of-book is indicative.
 
-## Web UI (unsupported)
+## 🕸️ Web UI (unsupported)
 
 `static/` excluded from the wheel; `web_ui.py` retained but unsupported — use the TUI, CLI `--json`, or MCP server instead.
 
-## MCP server (for Claude Code / Cursor / Hermes)
+## 🔌 MCP server (for Claude Code / Cursor / Hermes)
 
 Preferred surface for AI agents — typed, idempotent, single DB contract.
 
 ```bash
-python3 mcp_server.py                              # core — 54 tools (default, safe)
-PAPERTRADE_MCP_PROFILE=advanced python3 mcp_server.py  # 66 tools — adds destructive/specialist ops
-PAPERTRADE_MCP_PROFILE=full python3 mcp_server.py      # 73 tools — adds 7 legacy aliases (buy/sell/quote/…)
+python3 mcp_server.py                              # core — 60 tools (default, safe)
+PAPERTRADE_MCP_PROFILE=advanced python3 mcp_server.py  # 72 tools — adds destructive/specialist ops
+PAPERTRADE_MCP_PROFILE=full python3 mcp_server.py      # 79 tools — adds legacy aliases (buy/sell/quote/…)
 PAPERTRADE_MCP_RESPONSE_FORMAT=json python3 mcp_server.py  # force JSON contract
 # or via entry point after pip install -e .
 tradingcli-mcp
@@ -98,7 +113,7 @@ tradingcli-mcp
 
 `core` responses use `{"ok": true, "data": …}` / `{"ok": false, "error": {"code": "…", "message": "…"}}`. `mcp_catalog` reports the active profile + tool list. Mutating tools take `idempotency_key` + `agent` for safe retries.
 
-**Client config** — copy `.mcp.json` to your client's MCP config and fix the path:
+**Client config** 🔧 — copy `.mcp.json` to your client's MCP config and fix the path:
 
 ```json
 {
@@ -114,7 +129,7 @@ tradingcli-mcp
 
 For agents importing as a library instead of MCP, see `docs/agent-guide.md`.
 
-## Verify
+## ✅ Verify
 
 Tests are standalone scripts (no `pytest` needed):
 
@@ -133,6 +148,7 @@ python3 test_market_data.py
 python3 test_mcp_features.py
 python3 test_invariants.py
 python3 test_tui_parity.py
+python3 test_quote_cache.py
 ```
 
 ```bash
