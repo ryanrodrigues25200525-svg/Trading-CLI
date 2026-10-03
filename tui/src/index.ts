@@ -1,10 +1,10 @@
-// tradingcli-tui entry: arg parsing, TTY guard, and the OpenTUI render loop.
-// Read-only in Task 2: `--headless` exits 2 (Task 3 replaces it with the real
-// headless JSON implementation per Ruling 2).
+// tradingcli-tui entry: arg parsing, TTY guard, headless JSON, render loop.
 
 import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { createElement } from "react";
+import { parseHeadlessLookback, runHeadless, type HeadlessCmd } from "./headless";
+import { DEFAULT_LOOKBACK_DAYS } from "./views/BacktestView";
 import { App } from "./views/App";
 
 export interface TuiArgs {
@@ -12,17 +12,27 @@ export interface TuiArgs {
   interval: number;
   headless: boolean;
   json: boolean;
+  /** Headless subcommand (`snapshot` default). */
+  command?: HeadlessCmd;
+  lookbackDays: number;
 }
 
 export const DEFAULT_INTERVAL = 2.0;
-export const HEADLESS_STUB = "headless mode lands in Task 3";
 export const TTY_MESSAGE = "tradingcli-tui: need a TTY or --headless";
 
-/** Parse `-a/--account`, `-n/--interval`, `--headless`, `--json`. */
+/** Parse `-a/--account`, `-n/--interval`, `--headless`, `--json`,
+ * `--lookback-days N`, and one positional `snapshot|backtest` command. */
 export function parseArgs(argv: string[]): TuiArgs {
-  const args: TuiArgs = { account: undefined, interval: DEFAULT_INTERVAL, headless: false, json: false };
+  const args: TuiArgs = {
+    account: undefined,
+    interval: DEFAULT_INTERVAL,
+    headless: false,
+    json: false,
+    command: undefined,
+    lookbackDays: DEFAULT_LOOKBACK_DAYS,
+  };
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
+    const a = argv[i]!;
     if (a === "-a" || a === "--account") {
       const v = argv[++i];
       if (v === undefined) throw new Error(`missing value for '${a}'`);
@@ -37,6 +47,16 @@ export function parseArgs(argv: string[]): TuiArgs {
       args.headless = true;
     } else if (a === "--json") {
       args.json = true;
+    } else if (a === "--lookback-days") {
+      const raw = argv[++i];
+      if (raw === undefined) throw new Error(`missing value for '--lookback-days'`);
+      args.lookbackDays = parseHeadlessLookback(raw)!;
+    } else if (!a.startsWith("-")) {
+      if (a !== "snapshot" && a !== "backtest") {
+        throw new Error(`unknown argument '${a}' (expected 'snapshot' or 'backtest')`);
+      }
+      if (args.command !== undefined) throw new Error(`unexpected argument '${a}'`);
+      args.command = a;
     } else {
       throw new Error(`unknown argument '${a}'`);
     }
@@ -63,8 +83,12 @@ async function main(): Promise<void> {
     process.exit(2);
   }
   if (args.headless) {
-    process.stderr.write(`${HEADLESS_STUB}\n`);
-    process.exit(2);
+    // Single `{ok,…}` JSON envelope to stdout, exit 0/1, no ANSI/TTY.
+    await runHeadless(args.command ?? "snapshot", {
+      account: args.account,
+      lookbackDays: args.lookbackDays,
+    });
+    return;
   }
   const guard = ttyGuardMessage(process.stdin.isTTY ?? false, args.headless);
   if (guard !== null) {

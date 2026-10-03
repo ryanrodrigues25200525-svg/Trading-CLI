@@ -172,35 +172,77 @@ describe("dashboard store", () => {
     expect(ttyGuardMessage(false, false)).toContain("--headless");
     expect(ttyGuardMessage(false, true)).toBeNull();
     expect(ttyGuardMessage(true, false)).toBeNull();
-    expect(parseArgs([])).toEqual({ account: undefined, interval: 2.0, headless: false, json: false });
+    expect(parseArgs([])).toEqual({
+      account: undefined,
+      interval: 2.0,
+      headless: false,
+      json: false,
+      command: undefined,
+      lookbackDays: 1825,
+    });
     expect(parseArgs(["-a", "main", "-n", "5"])).toEqual({
       account: "main",
       interval: 5,
       headless: false,
       json: false,
+      command: undefined,
+      lookbackDays: 1825,
     });
     expect(parseArgs(["--account", "ira", "--interval", "1.5", "--headless", "--json"])).toEqual({
       account: "ira",
       interval: 1.5,
       headless: true,
       json: true,
+      command: undefined,
+      lookbackDays: 1825,
     });
-    // End-to-end: --headless exits 2 before any engine/TTY work (Ruling 2).
+    expect(parseArgs(["--headless", "--json", "snapshot", "-a", "ira"])).toEqual({
+      account: "ira",
+      interval: 2.0,
+      headless: true,
+      json: true,
+      command: "snapshot",
+      lookbackDays: 1825,
+    });
+    expect(parseArgs(["--headless", "backtest", "--lookback-days", "365"])).toEqual({
+      account: undefined,
+      interval: 2.0,
+      headless: true,
+      json: false,
+      command: "backtest",
+      lookbackDays: 365,
+    });
+    expect(() => parseArgs(["bogus"])).toThrow("unknown argument");
+    expect(() => parseArgs(["--lookback-days", "fortnight"])).toThrow("--lookback-days");
+    // End-to-end: --headless prints one {ok,…} envelope to stdout and exits
+    // 0 (Task 3 replaced the stub with the real headless implementation).
+    // Fresh temp DB → zero accounts, fully offline (market clock is local).
     const { join, dirname } = await import("node:path");
     const { fileURLToPath } = await import("node:url");
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
     const tuiRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-    const proc = Bun.spawn([process.execPath, join(tuiRoot, "src/index.ts"), "--headless"], {
-      cwd: tuiRoot,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const dbPath = join(mkdtempSync(join(tmpdir(), "tui-headless-")), "test.db");
+    const proc = Bun.spawn(
+      [process.execPath, join(tuiRoot, "src/index.ts"), "--headless", "--json", "snapshot"],
+      {
+        cwd: tuiRoot,
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, PAPERTRADE_DB: dbPath },
+      },
+    );
     const [out, err] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
     ]);
     const code = await proc.exited;
-    expect(code).toBe(2);
-    expect(err + out).toContain("headless mode lands in Task 3");
+    expect(err).not.toContain("headless mode lands in Task 3");
+    expect(code).toBe(0);
+    const envelope = JSON.parse(out.trim().split("\n").at(-1)!);
+    expect(envelope.ok).toBe(true);
+    expect(envelope.data.panels).toEqual([]);
+    expect(out).not.toContain("\u001b");
   });
 });
 
