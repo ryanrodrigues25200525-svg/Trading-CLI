@@ -72,7 +72,8 @@ export function App({
       }
       prevRef.current = merged;
       setSnap(next);
-      setError(null);
+      // A failed auto-tick shows alongside the panels (snapshot still rendered).
+      setError(next.tickError);
     } catch (e) {
       const message = e instanceof EngineError ? e.message : String(e);
       setError(message); // keep the last good frame underneath

@@ -77,6 +77,8 @@ export interface DashboardSnapshot {
   /** Flat pending list across all panels. */
   pending: PendingOrder[];
   asOf: string;
+  /** Auto-tick failure message, if the tick failed. Panels still render. */
+  tickError: string | null;
 }
 
 export interface LoadSnapshotOpts {
@@ -380,9 +382,21 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
     perAccount.some(({ positions }) =>
       positions.some((p) => isExpiredOcc(p.symbol, today)),
     );
+  let tickError: string | null = null;
   if (needsTick) {
-    await tick(engineOpts);
-    ({ perAccount, quotes } = await fetchAll(true));
+    try {
+      await tick(engineOpts);
+    } catch (e) {
+      // A failed tick (e.g. Yahoo rate-limit) must not nuke the read-only
+      // snapshot: fills may still have landed, so re-snapshot below and
+      // surface the message alongside the panels instead of throwing.
+      tickError = e instanceof Error ? e.message : String(e);
+    }
+    try {
+      ({ perAccount, quotes } = await fetchAll(true));
+    } catch {
+      // Re-snapshot failed too — keep the pre-tick data already in hand.
+    }
   }
 
   const clock = asClock(await marketClock(engineOpts));
@@ -448,5 +462,6 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
     clock,
     pending: panels.flatMap((p) => p.pending),
     asOf: clockTime(),
+    tickError,
   };
 }

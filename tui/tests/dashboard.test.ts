@@ -16,11 +16,19 @@ function mockCli(routes: {
   orders?: unknown;
   quotes?: Record<string, unknown>;
   market?: unknown;
+  tickFails?: boolean;
   onTick?: () => void;
 }): SpawnFn {
   return async (argv) => {
     const cmd = argv.join(" ");
     if (/(^|\s)tick(\s|--json|$)/.test(cmd) && !cmd.includes("snapshot")) {
+      if (routes.tickFails) {
+        return {
+          stdout: "",
+          stderr: JSON.stringify({ ok: false, error: "YFRateLimitError: Too Many Requests. Rate limited. Try after a while." }),
+          exitCode: 1,
+        };
+      }
       routes.onTick?.();
       return { stdout: JSON.stringify({ ok: true, output: ["tick ok"] }), stderr: "", exitCode: 0 };
     }
@@ -416,5 +424,41 @@ describe("quote cache (Yahoo rate-limit)", () => {
     // Pre-tick fetchAll + post-tick fresh re-snapshot: one quote call each.
     expect(counts.quotes).toBe(2);
     expect(snap.quotes["MSFT"]?.[0]).toBeCloseTo(101, 6);
+  });
+
+  test("tick failure still returns panels with tickError set", async () => {
+    const spawn = mockCli({
+      ...CACHE_BOOK,
+      orders: [
+        {
+          id: 9, account: "main", symbol: "MSFT", side: "buy", qty: 1.0,
+          order_type: "limit", limit_price: 350, stop_price: null,
+          trail_price: null, trail_percent: null, time_in_force: "gtc", status: "pending",
+        },
+      ],
+      tickFails: true,
+    });
+    const snap = await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(snap.panels).toHaveLength(1);
+    expect(snap.panels[0]!.name).toBe("main");
+    expect(snap.tickError).toMatch(/rate limit/i);
+  });
+
+  test("tick failure keeps pre-tick pending list", async () => {
+    const spawn = mockCli({
+      ...CACHE_BOOK,
+      orders: [
+        {
+          id: 9, account: "main", symbol: "MSFT", side: "buy", qty: 1.0,
+          order_type: "limit", limit_price: 350, stop_price: null,
+          trail_price: null, trail_percent: null, time_in_force: "gtc", status: "pending",
+        },
+      ],
+      tickFails: true,
+    });
+    const snap = await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(snap.pending).toHaveLength(1);
+    expect(snap.pending[0]!.label).toContain("#9");
+    expect(snap.tickError).not.toBeNull();
   });
 });
