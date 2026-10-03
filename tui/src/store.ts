@@ -87,6 +87,32 @@ export interface LoadSnapshotOpts {
   timeoutMs?: number;
   /** `YYYY-MM-DD` override (tests); defaults to today. */
   today?: string;
+  /** Display-quote TTL override in ms (tests); defaults to QUOTE_TTL_MS. */
+  quoteTtlMs?: number;
+  /** Clock override in ms (tests); defaults to Date.now(). */
+  nowMs?: number;
+  /** Bypass the quote cache (post-tick re-snapshot always sets this). */
+  freshQuotes?: boolean;
+}
+
+/** Display-quote TTL: Yahoo marks are cached this long to avoid rate-limiting.
+ * Fills/ticks always use live prices server-side; only the display path reads here. */
+export const QUOTE_TTL_MS = 15_000;
+
+type CachedQuote = { quote: [number, number | null] | null; atMs: number };
+// Per-spawn caches: the live TUI reuses one spawn (one cache per process),
+// while tests with distinct stubs stay isolated from each other.
+const quoteCaches = new WeakMap<object, Map<string, CachedQuote>>();
+const defaultQuoteCache = new Map<string, CachedQuote>();
+
+function cacheFor(spawn: SpawnFn | undefined): Map<string, CachedQuote> {
+  if (!spawn) return defaultQuoteCache;
+  let m = quoteCaches.get(spawn);
+  if (!m) {
+    m = new Map<string, CachedQuote>();
+    quoteCaches.set(spawn, m);
+  }
+  return m;
 }
 
 /** Python `{qty:g}` — drops the `.0` but keeps up to 6 significant digits. */
@@ -268,26 +294,42 @@ function asClock(payload: unknown): MarketClockInfo {
   };
 }
 
-/** One `data snapshot SYM` call → `[last, prevClose]`, or null on outage. */
+/** One `data snapshot SYM` call → `[last, prevClose]`, or null on outage.
+ * Display reads are TTL-cached per spawn (see QUOTE_TTL_MS); pass fresh:true
+ * after a tick so the post-fill re-snapshot shows live marks. */
 async function fetchQuote(
   symbol: string,
   opts: EngineOpts,
+  cache: Map<string, CachedQuote>,
+  ttlMs: number,
+  nowMs: number,
+  fresh: boolean,
 ): Promise<[number, number | null] | null> {
+  const key = symbol.toUpperCase();
+  if (!fresh) {
+    const hit = cache.get(key);
+    if (hit && nowMs - hit.atMs < ttlMs) return hit.quote;
+  }
   let payload: unknown;
   try {
     payload = await runCli(["data", "snapshot", symbol], opts);
   } catch {
-    return null;
+    const quote = null;
+    cache.set(key, { quote, atMs: nowMs });
+    return quote;
   }
-  if (typeof payload !== "object" || payload === null) return null;
-  const p = payload as Record<string, unknown>;
-  const quote =
-    typeof p["quote"] === "object" && p["quote"] !== null
-      ? (p["quote"] as Record<string, unknown>)
-      : p;
-  const last = nullableNum(quote["last"] ?? p["last"]);
-  if (last === null) return null;
-  return [last, nullableNum(p["previous_close"] ?? quote["previous_close"])];
+  let quote: [number, number | null] | null = null;
+  if (typeof payload === "object" && payload !== null) {
+    const p = payload as Record<string, unknown>;
+    const q =
+      typeof p["quote"] === "object" && p["quote"] !== null
+        ? (p["quote"] as Record<string, unknown>)
+        : p;
+    const last = nullableNum(q["last"] ?? p["last"]);
+    if (last !== null) quote = [last, nullableNum(p["previous_close"] ?? q["previous_close"])];
+  }
+  cache.set(key, { quote, atMs: nowMs });
+  return quote;
 }
 
 /**
@@ -300,8 +342,11 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
   const engineOpts: EngineOpts = { spawn: opts.spawn, timeoutMs: opts.timeoutMs };
   const prev = opts.prev ?? {};
   const today = opts.today ?? todayStr();
+  const ttlMs = opts.quoteTtlMs ?? QUOTE_TTL_MS;
+  const nowMs = opts.nowMs ?? Date.now();
+  const cache = cacheFor(opts.spawn);
 
-  const fetchAll = async () => {
+  const fetchAll = async (fresh: boolean) => {
     // `--detail` carries deposits/realized/created so TOTAL/return match Rich.
     const accounts = asAccounts(await runCli(["accounts", "--detail"], engineOpts)).filter(
       (a) => !opts.account || a.name === opts.account,
@@ -322,14 +367,14 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
       await Promise.all(
         [...symbols].map(async (s): Promise<[string, [number, number | null] | null]> => [
           s,
-          await fetchQuote(s, engineOpts),
+          await fetchQuote(s, engineOpts, cache, ttlMs, nowMs, fresh || opts.freshQuotes === true),
         ]),
       ),
     );
     return { accounts, perAccount, quotes };
   };
 
-  let { perAccount, quotes } = await fetchAll();
+  let { perAccount, quotes } = await fetchAll(false);
   const needsTick =
     perAccount.some(({ pending }) => pending.length > 0) ||
     perAccount.some(({ positions }) =>
@@ -337,7 +382,7 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
     );
   if (needsTick) {
     await tick(engineOpts);
-    ({ perAccount, quotes } = await fetchAll());
+    ({ perAccount, quotes } = await fetchAll(true));
   }
 
   const clock = asClock(await marketClock(engineOpts));

@@ -326,3 +326,95 @@ describe("dashboard views", () => {
     }
   });
 });
+
+describe("quote cache (Yahoo rate-limit)", () => {
+  // Display-quote TTL is 15_000 ms (QUOTE_TTL_MS in store.ts); tests pin it
+  // with literals plus nowMs control so no real waiting is involved.
+  const CACHE_BOOK = {
+    accounts: [{ name: "main", cash: 24900, default: true }],
+    positions: [
+      {
+        account: "main",
+        symbol: "MSFT",
+        side: "long",
+        qty: 1.0,
+        signed_qty: 1.0,
+        avg_entry_price: 100,
+        multiplier: 1.0,
+        asset_class: "spot",
+        margin: 0.0,
+      },
+    ],
+    orders: [],
+    quotes: { MSFT: { quote: { last: 101 }, previous_close: 99 } },
+  };
+
+  function countingSpawn(base: SpawnFn) {
+    const counts = { quotes: 0, ticks: 0 };
+    const spawn: SpawnFn = async (argv, opts) => {
+      const cmd = argv.join(" ");
+      if (cmd.includes("data") && cmd.includes("snapshot")) counts.quotes++;
+      if (/(^|\s)tick(\s|--json|$)/.test(cmd) && !cmd.includes("snapshot")) counts.ticks++;
+      return base(argv, opts);
+    };
+    return { spawn, counts };
+  }
+
+  test("second refresh within TTL spawns no new quote calls", async () => {
+    const { spawn, counts } = countingSpawn(mockCli(CACHE_BOOK));
+    const first = await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(first.quotes["MSFT"]?.[0]).toBeCloseTo(101, 6);
+    expect(counts.quotes).toBe(1);
+    const second = await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(second.quotes["MSFT"]?.[0]).toBeCloseTo(101, 6);
+    expect(counts.quotes).toBe(1);
+  });
+
+  test("expired TTL refetches quotes", async () => {
+    const { spawn, counts } = countingSpawn(mockCli(CACHE_BOOK));
+    await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(counts.quotes).toBe(1);
+    const later = await loadSnapshot({ spawn, nowMs: 1_000_000 + 15_000 + 1 });
+    expect(later.quotes["MSFT"]?.[0]).toBeCloseTo(101, 6);
+    expect(counts.quotes).toBe(2);
+  });
+
+  test("freshQuotes bypasses the cache", async () => {
+    const { spawn, counts } = countingSpawn(mockCli(CACHE_BOOK));
+    await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    await loadSnapshot({ spawn, nowMs: 1_000_000, freshQuotes: true });
+    expect(counts.quotes).toBe(2);
+  });
+
+  test("outage nulls are cached, not re-fetched", async () => {
+    const { spawn, counts } = countingSpawn(mockCli({ ...CACHE_BOOK, quotes: {} }));
+    const first = await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(first.quotes["MSFT"]).toBeNull();
+    expect(counts.quotes).toBe(1);
+    const second = await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(second.quotes["MSFT"]).toBeNull();
+    expect(counts.quotes).toBe(1);
+  });
+
+  test("post-tick re-snapshot is fresh even within TTL", async () => {
+    let ticks = 0;
+    const { spawn, counts } = countingSpawn(
+      mockCli({
+        ...CACHE_BOOK,
+        orders: [
+          {
+            id: 1, account: "main", symbol: "MSFT", side: "sell", qty: 1.0,
+            order_type: "stop", limit_price: null, stop_price: 95,
+            trail_price: null, trail_percent: null, time_in_force: "gtc", status: "pending",
+          },
+        ],
+        onTick: () => ticks++,
+      }),
+    );
+    const snap = await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(ticks).toBe(1);
+    // Pre-tick fetchAll + post-tick fresh re-snapshot: one quote call each.
+    expect(counts.quotes).toBe(2);
+    expect(snap.quotes["MSFT"]?.[0]).toBeCloseTo(101, 6);
+  });
+});
