@@ -106,10 +106,14 @@ export const QUOTE_TTL_MS = 15 * 60_000;
 /** After a failed auto-tick, wait this long before trying again. Manual `t` is unaffected. */
 export const TICK_FAIL_COOLDOWN_MS = 60_000;
 
+/** Market-clock reads are local but still spawn Python; cache briefly. */
+export const CLOCK_TTL_MS = 60_000;
+
 type CachedQuote = { quote: [number, number | null] | null; atMs: number };
 
 interface SpawnState {
   quotes: Map<string, CachedQuote>;
+  clock: { atMs: number; value: MarketClockInfo } | null;
   lastTickFailureAt: number | null;
   lastTickFailureMsg: string | null;
 }
@@ -118,6 +122,7 @@ interface SpawnState {
 const spawnStates = new WeakMap<object, SpawnState>();
 const defaultSpawnState: SpawnState = {
   quotes: new Map<string, CachedQuote>(),
+  clock: null,
   lastTickFailureAt: null,
   lastTickFailureMsg: null,
 };
@@ -128,12 +133,19 @@ function stateFor(spawn: SpawnFn | undefined): SpawnState {
   if (!m) {
     m = {
       quotes: new Map<string, CachedQuote>(),
+      clock: null,
       lastTickFailureAt: null,
       lastTickFailureMsg: null,
     };
     spawnStates.set(spawn, m);
   }
   return m;
+}
+
+/** Did a tick run change anything (fill/settle/expire/reject)? Skip lines don't count. */
+export function tickChanged(output: unknown): boolean {
+  const text = Array.isArray(output) ? output.join("\n") : String(output ?? "");
+  return /^\s*(filled|settled|exercised|expired|rejected|canceled|margin call)/im.test(text);
 }
 
 /** Python `{qty:g}` — drops the `.0` but keeps up to 6 significant digits. */
@@ -369,7 +381,7 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
   const state = stateFor(opts.spawn);
   const cache = state.quotes;
 
-  const fetchAll = async (fresh: boolean) => {
+  const fetchMeta = async () => {
     // `--detail` carries deposits/realized/created so TOTAL/return match Rich.
     const accounts = asAccounts(await runCli(["accounts", "--detail"], engineOpts)).filter(
       (a) => !opts.account || a.name === opts.account,
@@ -381,12 +393,19 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
         pending: asPending(await runCli(["order", "list", "-a", a.name], engineOpts)),
       })),
     );
+    return { accounts, perAccount };
+  };
+
+  const fetchQuotes = async (
+    perAccount: Awaited<ReturnType<typeof fetchMeta>>["perAccount"],
+    fresh: boolean,
+  ) => {
     const symbols = new Set<string>();
     for (const { positions, pending } of perAccount) {
       for (const p of positions) symbols.add(p.symbol);
       for (const o of pending) symbols.add(o.symbol);
     }
-    const quotes = Object.fromEntries(
+    return Object.fromEntries(
       await Promise.all(
         [...symbols].map(async (s): Promise<[string, [number, number | null] | null]> => [
           s,
@@ -394,26 +413,43 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
         ]),
       ),
     );
-    return { accounts, perAccount, quotes };
   };
 
-  let { perAccount, quotes } = await fetchAll(false);
+  const fetchClock = async (): Promise<MarketClockInfo> => {
+    const hit = state.clock;
+    if (hit && nowMs - hit.atMs < CLOCK_TTL_MS) return hit.value;
+    const value = asClock(await marketClock(engineOpts));
+    state.clock = { atMs: nowMs, value };
+    return value;
+  };
+
+  // Meta first (all local DB reads): quotes only download once the panel set
+  // is known, and never twice per refresh.
+  let { accounts, perAccount } = await fetchMeta();
+  void accounts;
   const needsTick =
     perAccount.some(({ pending }) => pending.length > 0) ||
     perAccount.some(({ positions }) =>
       positions.some((p) => isExpiredOcc(p.symbol, today)),
     );
   let tickError: string | null = null;
+  let changed = false;
   const coolingDown =
     state.lastTickFailureAt !== null && nowMs - state.lastTickFailureAt < cooldownMs;
   if (needsTick && !coolingDown) {
     try {
-      await tick(engineOpts);
+      const out = await tick(engineOpts);
       state.lastTickFailureAt = null;
       state.lastTickFailureMsg = null;
+      // Re-read meta only when the tick actually changed something; a quiet
+      // tick leaves every position, order, and cash figure untouched.
+      if (tickChanged(out)) {
+        changed = true;
+        ({ accounts, perAccount } = await fetchMeta());
+      }
     } catch (e) {
       // A failed tick (e.g. Yahoo rate-limit) must not nuke the read-only
-      // snapshot: fills may still have landed, so re-snapshot below and
+      // snapshot: fills may still have landed, so re-read meta below and
       // surface the message alongside the panels instead of throwing.
       // Further auto-ticks back off until the cooldown elapses; manual `t`
       // always runs immediately.
@@ -421,17 +457,19 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
       state.lastTickFailureAt = nowMs;
       state.lastTickFailureMsg = message;
       tickError = message;
-    }
-    try {
-      ({ perAccount, quotes } = await fetchAll(true));
-    } catch {
-      // Re-snapshot failed too — keep the pre-tick data already in hand.
+      try {
+        ({ accounts, perAccount } = await fetchMeta());
+      } catch {
+        // Re-read failed too — keep the pre-tick data already in hand.
+      }
+      changed = true; // show live marks: fills may have landed before the error
     }
   } else if (needsTick) {
     tickError = state.lastTickFailureMsg;
   }
+  const quotes = await fetchQuotes(perAccount, changed);
 
-  const clock = asClock(await marketClock(engineOpts));
+  const clock = await fetchClock();
   const panels: AccountPanel[] = perAccount.map(({ account, positions, pending }) => {
     let equity = account.cash;
     let upnlSum = 0;

@@ -19,6 +19,7 @@ function mockCli(routes: {
   quotes?: Record<string, unknown>;
   market?: unknown;
   tickFails?: boolean;
+  tickOutput?: string[];
   onTick?: () => void;
 }): SpawnFn {
   return async (argv) => {
@@ -32,7 +33,7 @@ function mockCli(routes: {
         };
       }
       routes.onTick?.();
-      return { stdout: JSON.stringify({ ok: true, output: ["tick ok"] }), stderr: "", exitCode: 0 };
+      return { stdout: JSON.stringify({ ok: true, output: routes.tickOutput ?? ["tick ok"] }), stderr: "", exitCode: 0 };
     }
     if (cmd.includes("accounts")) {
       return { stdout: JSON.stringify(routes.accounts ?? []), stderr: "", exitCode: 0 };
@@ -67,6 +68,20 @@ function mockCli(routes: {
     }
     throw new Error(`unmocked CLI call: ${cmd}`);
   };
+}
+
+/** Count engine argv by kind (refresh-economy assertions). */
+function countingSpawn(base: SpawnFn) {
+  const counts = { quotes: 0, ticks: 0, meta: 0, market: 0 };
+  const spawn: SpawnFn = async (argv, opts) => {
+    const cmd = argv.join(" ");
+    if (cmd.includes("data") && cmd.includes("snapshot")) counts.quotes++;
+    if (/(^|\s)tick(\s|--json|$)/.test(cmd) && !cmd.includes("snapshot")) counts.ticks++;
+    if (cmd.includes("accounts") || cmd.includes("positions") || (cmd.includes("order") && cmd.includes("list"))) counts.meta++;
+    if (/(^|\s)market(\s|--json|$)/.test(cmd)) counts.market++;
+    return base(argv, opts);
+  };
+  return { spawn, counts };
 }
 
 describe("dashboard store", () => {
@@ -431,17 +446,6 @@ describe("quote cache (Yahoo rate-limit)", () => {
     quotes: { MSFT: { quote: { last: 101 }, previous_close: 99 } },
   };
 
-  function countingSpawn(base: SpawnFn) {
-    const counts = { quotes: 0, ticks: 0 };
-    const spawn: SpawnFn = async (argv, opts) => {
-      const cmd = argv.join(" ");
-      if (cmd.includes("data") && cmd.includes("snapshot")) counts.quotes++;
-      if (/(^|\s)tick(\s|--json|$)/.test(cmd) && !cmd.includes("snapshot")) counts.ticks++;
-      return base(argv, opts);
-    };
-    return { spawn, counts };
-  }
-
   test("second refresh within TTL spawns no new quote calls", async () => {
     const { spawn, counts } = countingSpawn(mockCli(CACHE_BOOK));
     const first = await loadSnapshot({ spawn, nowMs: 1_000_000 });
@@ -478,7 +482,8 @@ describe("quote cache (Yahoo rate-limit)", () => {
     expect(counts.quotes).toBe(1);
   });
 
-  test("post-tick re-snapshot is fresh even within TTL", async () => {    let ticks = 0;
+  test("post-tick re-snapshot is fresh even within TTL", async () => {
+    let ticks = 0;
     const { spawn, counts } = countingSpawn(
       mockCli({
         ...CACHE_BOOK,
@@ -489,13 +494,15 @@ describe("quote cache (Yahoo rate-limit)", () => {
             trail_price: null, trail_percent: null, time_in_force: "gtc", status: "pending",
           },
         ],
+        tickOutput: ["filled #1 sell 1 MSFT @ 101.00"],
         onTick: () => ticks++,
       }),
     );
     const snap = await loadSnapshot({ spawn, nowMs: 1_000_000 });
     expect(ticks).toBe(1);
-    // Pre-tick fetchAll + post-tick fresh re-snapshot: one quote call each.
-    expect(counts.quotes).toBe(2);
+    // A fill changed the book: meta re-read (3x2), quotes re-fetched fresh once.
+    expect(counts.meta).toBe(6);
+    expect(counts.quotes).toBe(1);
     expect(snap.quotes["MSFT"]?.[0]).toBeCloseTo(101, 6);
   });
 
@@ -551,13 +558,13 @@ describe("quote cache (Yahoo rate-limit)", () => {
     const first = await loadSnapshot({ spawn, nowMs: 1_000_000 });
     expect(counts.ticks).toBe(1);
     expect(first.tickError).not.toBeNull();
-    expect(counts.quotes).toBe(2); // pre-tick fetch + post-failure fresh re-snapshot
+    expect(counts.quotes).toBe(1); // only the end-of-refresh fetch (pre-tick is quoteless now)
     // 30s later: no new tick attempt, no new quote calls, error retained.
     const second = await loadSnapshot({ spawn, nowMs: 1_000_000 + 30_000 });
     expect(counts.ticks).toBe(1);
     expect(second.panels).toHaveLength(1);
     expect(second.tickError).not.toBeNull();
-    expect(counts.quotes).toBe(2);
+    expect(counts.quotes).toBe(1);
   });
 
   test("auto-tick retries after the cooldown", async () => {
@@ -674,5 +681,84 @@ describe("panel scale", () => {
         setup.renderer.destroy();
       }
     }
+  });
+});
+
+describe("refresh economy", () => {
+  const FILL_BOOK = {
+    accounts: [{ name: "main", cash: 24900, default: true }],
+    positions: [
+      {
+        account: "main", symbol: "MSFT", side: "long", qty: 1.0, signed_qty: 1.0,
+        avg_entry_price: 100, multiplier: 1.0, asset_class: "spot", margin: 0.0,
+      },
+    ],
+    orders: [
+      {
+        id: 1, account: "main", symbol: "MSFT", side: "sell", qty: 1.0,
+        order_type: "stop", limit_price: null, stop_price: 95,
+        trail_price: null, trail_percent: null, time_in_force: "gtc", status: "pending",
+      },
+    ],
+    quotes: { MSFT: { quote: { last: 101 }, previous_close: 99 } },
+  };
+
+  test("quiet refresh fetches meta once and quotes once", async () => {
+    const { spawn, counts } = countingSpawn(mockCli({ ...FILL_BOOK, orders: [] }));
+    await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(counts.meta).toBe(3); // accounts + positions + order list
+    expect(counts.quotes).toBe(1);
+    expect(counts.ticks).toBe(0);
+    expect(counts.market).toBe(1);
+  });
+
+  test("tick with no fills skips the second meta fetch", async () => {
+    const { spawn, counts } = countingSpawn(
+      mockCli({ ...FILL_BOOK, tickOutput: ["#1 MSFT: price 101.00, limit 95.00"] }),
+    );
+    const snap = await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(counts.ticks).toBe(1);
+    expect(counts.meta).toBe(3);
+    expect(counts.quotes).toBe(1);
+    expect(snap.tickError).toBeNull();
+    expect(snap.pending).toHaveLength(1);
+  });
+
+  test("tick with fills refetches meta and fresh quotes", async () => {
+    const routes = {
+      ...FILL_BOOK,
+      tickOutput: ["filled #1 sell 1 MSFT @ 101.00"],
+    };
+    const { spawn, counts } = countingSpawn(mockCli(routes));
+    const first = await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(counts.ticks).toBe(1);
+    expect(counts.meta).toBe(6);
+    expect(counts.quotes).toBe(1);
+    expect(first.quotes["MSFT"]?.[0]).toBeCloseTo(101, 6);
+    // Cache is warm at 101; a second fill forces a live re-fetch at 999.
+    routes.quotes = { MSFT: { quote: { last: 999 }, previous_close: 99 } };
+    const second = await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(counts.ticks).toBe(2);
+    expect(counts.quotes).toBe(2);
+    expect(second.quotes["MSFT"]?.[0]).toBeCloseTo(999, 6);
+  });
+
+  test("market clock is cached for a minute", async () => {
+    const { spawn, counts } = countingSpawn(mockCli({ ...FILL_BOOK, orders: [] }));
+    await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    await loadSnapshot({ spawn, nowMs: 1_000_000 + 30_000 });
+    expect(counts.market).toBe(1);
+    await loadSnapshot({ spawn, nowMs: 1_000_000 + 61_000 });
+    expect(counts.market).toBe(2);
+  });
+
+  test("tickChanged spots fills, ignores skip lines", async () => {
+    const { tickChanged } = await import("../src/store");
+    expect(tickChanged(["filled #1 sell 1 MSFT @ 101.00"])).toBe(true);
+    expect(tickChanged(["settled ABC @ 1.2", "expired #2 X"])).toBe(true);
+    expect(tickChanged(["#1 MSFT: price 101.00, limit 95.00"])).toBe(false);
+    expect(tickChanged(["tick ok"])).toBe(false);
+    expect(tickChanged([])).toBe(false);
+    expect(tickChanged(null)).toBe(false);
   });
 });
