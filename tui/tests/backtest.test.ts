@@ -141,7 +141,32 @@ describe("backtest view", () => {
     expect(closed).toBe(1);
   });
 
-  test("q closes the backtest prompt", async () => {
+  test("q with account input focused types q (no close, no mutation)", async () => {
+    let closed = 0;
+    let picked = 0;
+    const setup = await testRender(
+      createElement(BacktestPrompt, {
+        defaultAccount: "main",
+        onClose: () => closed++,
+        onPick: () => picked++,
+      }),
+      { width: 100, height: 20 },
+    );
+    try {
+      // Account field is focused on open, so q must land in the input.
+      // (The input renders a narrow visible tail: "main" shows as "in".)
+      await setup.waitForFrame((f) => f.includes("Backtesting"));
+      await setup.mockInput.pressKeys(["q"]);
+      const frame = await setup.waitForFrame((f) => f.includes("inq"));
+      expect(frame).toContain("inq");
+      expect(closed).toBe(0);
+      expect(picked).toBe(0);
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
+
+  test("q with nothing focused closes the prompt", async () => {
     let closed = 0;
     let picked = 0;
     const setup = await testRender(
@@ -154,7 +179,16 @@ describe("backtest view", () => {
     );
     try {
       await setup.waitForFrame((f) => f.includes("Backtesting"));
+      // Real sleeps between keys: the test harness flush() does not fully
+      // pump successive update cycles back-to-back (chained updates need a
+      // real event-loop turn; verified with probe11 — not an app bug).
+      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      setup.mockInput.pressTab(); // account -> history
+      await sleep(300);
+      setup.mockInput.pressTab(); // history -> nothing focused
+      await sleep(300);
       await setup.mockInput.pressKeys(["q"]);
+      await sleep(300);
       await setup.flush();
       expect(closed).toBe(1);
       expect(picked).toBe(0);

@@ -248,14 +248,25 @@ export function BacktestPrompt({
 }: BacktestPromptProps) {
   const [account, setAccount] = useState(defaultAccount ?? "");
   const [history, setHistory] = useState("5y");
-  const [active, setActive] = useState(0);
+  // Which field owns the keyboard, or "none" when nothing is focused. Tab
+  // cycles account → history → none → account, mirroring OrderModal's
+  // one-focused-control discipline with an explicit unfocused stop. (A
+  // nullish sentinel is unusable: this React reconciler drops nullish
+  // state updates, so the unfocused state needs a real value.)
+  const [focus, setFocus] = useState<"account" | "history" | "none">("account");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   useKeyboard((key) => {
     if (busy) return;
-    if (key.name === "escape" || key.name === "q") onClose();
-    else if (key.name === "tab") setActive((i) => (i + 1) % 2);
+    if (key.name === "escape") onClose();
+    // q aborts only when no text input is focused: a focused <input>
+    // consumes q as typed text (account names may contain q).
+    else if (key.name === "q") {
+      if (focus === "none") onClose();
+    } else if (key.name === "tab") {
+      setFocus((f) => (f === "account" ? "history" : f === "history" ? "none" : "account"));
+    }
   });
 
   const submit = async () => {
@@ -287,17 +298,17 @@ export function BacktestPrompt({
       <box flexDirection="row">
         <text>{"  which: "}</text>
         <input
-          focused={active === 0}
+          focused={focus === "account"}
           value={account}
           placeholder={defaultAccount ?? ""}
           onInput={setAccount}
-          onSubmit={() => setActive(1)}
+          onSubmit={() => setFocus("history")}
         />
       </box>
       <box flexDirection="row">
         <text>{"  history (6m/1y/2y/5y/10y/max or days) [5y]: "}</text>
         <input
-          focused={active === 1}
+          focused={focus === "history"}
           value={history}
           onInput={setHistory}
           onSubmit={() => void submit()}
@@ -305,7 +316,7 @@ export function BacktestPrompt({
       </box>
       {busy ? <text>{"  reconstructing current performance and backtesting…"}</text> : null}
       {error !== null ? <text>{"  [!] "}{error}</text> : null}
-      <text>{"  (Enter) next · (Esc) abort"}</text>
+      <text>{"  (Enter) next · (Tab) move focus · (Esc) abort · (q) abort when unfocused"}</text>
     </box>
   );
 }
