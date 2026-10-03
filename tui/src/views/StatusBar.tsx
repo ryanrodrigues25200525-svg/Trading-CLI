@@ -5,7 +5,7 @@ import type { MarketClockInfo } from "../store";
 
 export const LOGO = "▀█▀ █▀█ ▄▀█ █▀▄ █ █▄ █ █▀▀ █▀▀ █   █\n █  █▀▄ █▀█ █▄▀ █ █ ▀█ █▄█ █▄▄ █▄▄ █";
 export const RED = "#ff2b4a";
-export const GREY = "grey35";
+export const GREY = "#808080";
 export const GREEN = "green";
 
 export function clockLine(clock: MarketClockInfo): string {

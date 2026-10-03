@@ -9,7 +9,7 @@ import type { AccountPanel, PositionRow, Tickmark } from "../store";
 import { fmtQty } from "../store";
 
 export const RED = "#ff2b4a";
-export const GREY = "grey35";
+export const GREY = "#808080";
 export const GREEN = "green";
 export const YELLOW = "yellow";
 
@@ -102,8 +102,22 @@ function rowSegs(row: PositionRow): Seg[] {
   ];
 }
 
-function statSegs(label: string, value: Seg): Seg[] {
-  return [{ t: `${label} `, fg: GREY }, value, { t: "  " }];
+/** Fixed-width stat block: grey 8-char label + right-aligned value. */
+export function statCell(label: string, value: Seg, width: number): Seg[] {
+  const head = label.padEnd(8).slice(0, 8);
+  return [
+    { t: head, fg: GREY },
+    { t: value.t.padStart(Math.max(width - 8, value.t.length)), fg: value.fg },
+  ];
+}
+
+/** Inner content width of the positions table (columns + separators). */
+export function tableWidth(): number {
+  return COLS.reduce((sum, [, w]) => sum + w, 0) + (COLS.length - 1);
+}
+
+function ruleSeg(): Seg {
+  return { t: "─".repeat(tableWidth()), fg: GREY };
 }
 
 function line(segs: Seg[], key: number): ReactNode {
@@ -125,7 +139,7 @@ function line(segs: Seg[], key: number): ReactNode {
 export function AccountPanelView({ panel }: { panel: AccountPanel }) {
   const title = panel.isDefault ? `${panel.name.toUpperCase()} ★` : panel.name.toUpperCase();
   const accent = panel.isDefault ? RED : GREY;
-  const lines: ReactNode[] = [line(headerSegs(), 0)];
+  const lines: ReactNode[] = [line(headerSegs(), 0), line([ruleSeg()], 1)];
   if (panel.positions.length === 0) {
     lines.push(
       <text key="empty" fg={GREY}>
@@ -133,28 +147,46 @@ export function AccountPanelView({ panel }: { panel: AccountPanel }) {
       </text>,
     );
   } else {
-    panel.positions.forEach((row, i) => lines.push(line(rowSegs(row), i + 1)));
+    panel.positions.forEach((row, i) => lines.push(line(rowSegs(row), i + 2)));
   }
-  lines.push(<text key="gap">{" "}</text>);
+  lines.push(line([ruleSeg()], 90));
+  const cellWidth = Math.floor((tableWidth() - 2) / 3);
+  const statRow = (cells: Seg[][], key: number): ReactNode => (
+    <text key={key}>
+      {cells.map((segs, i) => (
+        <span key={i}>
+          {segs.map((s, j) =>
+            s.fg ? (
+              <span key={j} fg={s.fg}>
+                {s.t}
+              </span>
+            ) : (
+              <span key={j}>{s.t}</span>
+            ),
+          )}
+          {i < cells.length - 1 ? " " : ""}
+        </span>
+      ))}
+    </text>
+  );
   lines.push(
-    line(
+    statRow(
       [
-        ...statSegs("CASH", { t: commas(panel.cash) }),
-        ...statSegs("EQUITY", { t: commas(panel.equity) }),
-        ...statSegs("DAY", signedSeg(panel.day)),
+        statCell("CASH", { t: commas(panel.cash) }, cellWidth),
+        statCell("EQUITY", { t: commas(panel.equity) }, cellWidth),
+        statCell("DAY", signedSeg(panel.day), cellWidth),
       ],
       100,
     ),
   );
+  const totalSeg = signedSeg(panel.total);
+  const retSeg = signedSeg(panel.retPct, "%");
   lines.push(
-    line(
+    statRow(
       [
-        ...statSegs("UNREAL", signedSeg(panel.unreal)),
-        ...statSegs("REALIZED", signedSeg(panel.realized)),
-        ...statSegs("TOTAL", {
-          ...signedSeg(panel.total),
-          t: `${signedSeg(panel.total).t} (${signedSeg(panel.retPct, "%").t})`,
-        }),
+        statCell("UNREAL", signedSeg(panel.unreal), cellWidth),
+        statCell("REALIZED", signedSeg(panel.realized), cellWidth),
+        statCell("TOTAL", { t: `${totalSeg.t} (${retSeg.t})`, fg: totalSeg.fg }, cellWidth),
       ],
       101,
     ),

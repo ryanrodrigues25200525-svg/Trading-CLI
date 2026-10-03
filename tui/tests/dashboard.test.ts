@@ -367,7 +367,26 @@ describe("shortError (engine error display)", () => {
   });
 });
 
-describe("panel colors", () => {  test("gains green, losses red, zero counts as gain", () => {
+describe("panel structure", () => {
+  test("header rule spans the table width", async () => {
+    const { tableWidth } = await import("../src/views/PortfolioPanels");
+    expect(tableWidth()).toBe(14 + 6 + 9 + 10 + 13 + 12 + 12 + 10 + 7);
+  });
+
+  test("stat cells align label and value columns", async () => {
+    const { statCell } = await import("../src/views/PortfolioPanels");
+    const text = (segs: Array<{ t: string }>) => segs.map((s) => s.t).join("");
+    const a = text(statCell("CASH", { t: "100,000.00" }, 30));
+    const b = text(statCell("EQUITY", { t: "99,999.99" }, 30));
+    expect(a.length).toBe(30);
+    expect(b.length).toBe(30);
+    expect(a).toBe(`CASH${" ".repeat(16)}100,000.00`);
+    expect(b).toBe(`EQUITY${" ".repeat(15)}99,999.99`);
+  });
+});
+
+describe("panel colors", () => {
+  test("gains green, losses red, zero counts as gain", () => {
     expect(gainFg(1.5)).toBe("green");
     expect(gainFg(-0.01)).toBe("#ff2b4a");
     expect(gainFg(0)).toBe("green");
@@ -378,13 +397,13 @@ describe("panel colors", () => {  test("gains green, losses red, zero counts as 
     expect(sideSeg(false)).toEqual({ t: "SHORT", fg: "#ff2b4a" });
     expect(tickSeg("▲")).toEqual({ t: "▲", fg: "green" });
     expect(tickSeg("▼")).toEqual({ t: "▼", fg: "#ff2b4a" });
-    expect(tickSeg("·")).toEqual({ t: "·", fg: "grey35" });
+    expect(tickSeg("·")).toEqual({ t: "·", fg: "#808080" });
   });
 
   test("signed segments carry color, nulls are grey ?", () => {
     expect(signedSeg(12.5)).toEqual({ t: "+12.50", fg: "green" });
     expect(signedSeg(-3)).toEqual({ t: "-3.00", fg: "#ff2b4a" });
-    expect(signedSeg(null)).toEqual({ t: "?", fg: "grey35" });
+    expect(signedSeg(null)).toEqual({ t: "?", fg: "#808080" });
     expect(signedSeg(8, "%")).toEqual({ t: "+8.00%", fg: "green" });
   });
 });
