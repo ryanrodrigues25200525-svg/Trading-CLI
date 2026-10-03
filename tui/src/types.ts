@@ -1,6 +1,7 @@
 // Shared types for the tradingcli-tui engine bridge.
-// The Python CLI (`papertrade.py … --json`) always replies with the envelope
-// `{ok: true, data} | {ok: false, error}`; this module types that contract.
+// Real CLI contract: success prints the command's own JSON (usually a bare
+// array/object) on stdout; failures print `{ok: false, error}` on stderr
+// with a nonzero exit. Only the failure half uses the `Ok<T>` envelope.
 
 /** CLI JSON envelope: `{ok: true, data} | {ok: false, error}`. */
 export type Ok<T> = { ok: true; data: T } | { ok: false; error: string };
