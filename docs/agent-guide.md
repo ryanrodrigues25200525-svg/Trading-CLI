@@ -10,7 +10,7 @@
 | `mcp_server.py` | MCP server (54 core / 66 advanced / 73 full tools). Preferred agent entry point over raw CLI. |
 | `dashboard.py` | Legacy Rich dashboard (`tradingcli dash --rich`). Superseded by the TUI. |
 | `tui/` | OpenTUI dashboard (Bun + `@opentui/react`): `tradingcli-tui` / `tradingcli dash`. Headless: `tradingcli-tui --headless --json snapshot` (single `{ok, data}` envelope, no TTY — prefer this or MCP over screen-scraping). |
-| `web_ui.py` | Unsupported (retained file, not advertised, excluded from the wheel). |
+| `web_ui.py` | Unsupported (retained and still shipped file, not advertised). |
 | `portfolio_backtest.py` | `backtesting.py` engine for current-holdings retrospective. |
 | `test_*.py` | Standalone scripts (`python3 test_papertrade.py`), not `pytest`. |
 | `static/index.html` | Unsupported legacy SPA (retained file, excluded from the wheel). |
@@ -165,7 +165,7 @@ All new MCP tools are in `core` (now 60 tools) — no profile change needed for 
 ## Pitfalls
 
 - **Don't import `papertrade` and then shell out to `papertrade.py` in the same flow** — you'll double-open the DB. Pick one surface.
-- **Yahoo is rate-limited and aggregated.** Historical quotes/trades are marked as such; crypto order-book is indicative. Don't claim tick-level fidelity.
+- **Yahoo is rate-limited and aggregated.** Historical quotes/trades are marked as such; crypto order-book is indicative. Don't claim tick-level fidelity. Read-path marks (`quote`, `data snapshot`, `bulk_quotes`, `market_snapshot`) are delayed up to `QUOTE_TTL_SEC` (60s); fills and ticks always price live. Call `pt.clear_quote_cache()` in long-lived processes (MCP server, notebooks) when you need a guaranteed-fresh mark.
 - **Options history is stubbed** in backtests (reported as `skipped`).
 - **Corporate actions** need an explicit `sync_corporate_actions` / `pt.sync_corporate_actions(conn, account)` — they are not auto-applied.
 - **`.papertrade.db*` is gitignored.** Backups go to `~/.papertrade_backups/`.

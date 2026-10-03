@@ -13,6 +13,7 @@ Run: python3 test_tui_parity.py (no pytest dependency, repo convention).
 import json
 import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -123,7 +124,9 @@ def test_packaging_and_dash():
     """`tradingcli-tui` script exists; `dash` accepts --rich/-a/-n."""
     text = (root / "pyproject.toml").read_text()
     check('tradingcli-tui = "papertrade:main_tui_shim"' in text, "missing tradingcli-tui script")
-    check("static/" not in text, "static/ must be dropped from wheel include")
+    include = re.search(r"include\s*=\s*\[(?P<body>[^\]]*)\]", text)
+    check(include is not None, "wheel include block not found")
+    check("static/" not in include.group("body"), "static/ must be dropped from wheel include")
     check(hasattr(pt, "main_tui_shim"), "missing papertrade.main_tui_shim")
     parser = pt._build_parser()
     dash_args = parser.parse_args(["dash", "--rich", "-a", "parity", "-n", "1.5"])

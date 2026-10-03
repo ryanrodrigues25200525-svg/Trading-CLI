@@ -23,6 +23,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -3736,8 +3737,19 @@ def market_history(
     return {"symbol": symbol, "kind": kind, "timeframe": timeframe, "data": rows}
 
 
+QUOTE_TTL_SEC = 60
+_QUOTE_CACHE: dict = {}
+
+
 def latest_quote(symbol):
+    """Live quote with bid/ask/last. Read-path marks are delayed up to
+    QUOTE_TTL_SEC (see _QUOTE_CACHE) to respect Yahoo rate limits; failures
+    are never cached. Fills always use live_price directly — never this."""
     symbol = symbol.strip().upper()
+    now = time.monotonic()
+    hit = _QUOTE_CACHE.get(symbol)
+    if hit is not None and now - hit[1] < QUOTE_TTL_SEC:
+        return hit[0]
     _quiet_yf()
     import yfinance as yf
 
@@ -3748,7 +3760,7 @@ def latest_quote(symbol):
         info = {}
     price = live_price(symbol)
     bid, ask = _number(info.get("bid")), _number(info.get("ask"))
-    return {
+    payload = {
         "symbol": symbol,
         "bid": bid or price,
         "ask": ask or price,
@@ -3756,6 +3768,13 @@ def latest_quote(symbol):
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "indicative": bid is None or ask is None,
     }
+    _QUOTE_CACHE[symbol] = (payload, now)
+    return payload
+
+
+def clear_quote_cache():
+    """Drop all cached read-path marks (tests, diagnostics)."""
+    _QUOTE_CACHE.clear()
 
 
 def latest_trade(symbol):
@@ -4677,7 +4696,7 @@ def _pkg_version():
         from importlib.metadata import version as _v
         return _v("tradingcli")
     except Exception:
-        return "0.5.0"
+        return "0.5.1"
 
 __version__ = _pkg_version()
 
@@ -5090,8 +5109,16 @@ def _run_cli(args):
                     " use 'tradingcli dash --rich' for the legacy dashboard"
                 )
             # exec inherits environ, so PAPERTRADE_DB flows into the TUI.
-            os.execv(bun, [bun, os.path.join(base, "tui", "src", "index.ts"), *passthrough])
-        os.execv(sys.executable, [sys.executable, os.path.join(base, "dashboard.py"), *passthrough])
+            try:
+                os.execv(bun, [bun, os.path.join(base, "tui", "src", "index.ts"), *passthrough])
+            except OSError as exc:
+                raise SystemExit(
+                    f"cannot launch the TUI ({exc}); use 'tradingcli dash --rich'"
+                )
+        try:
+            os.execv(sys.executable, [sys.executable, os.path.join(base, "dashboard.py"), *passthrough])
+        except OSError as exc:
+            raise SystemExit(f"cannot launch the legacy dashboard ({exc})")
     if args.cmd == "chain":
         show_chain(args.underlying, args.expiry)
         return

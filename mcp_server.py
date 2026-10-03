@@ -713,14 +713,17 @@ def validate_symbol(symbol: str) -> str:
 
 @mcp.tool()
 def bulk_quotes(symbols: str) -> str:
-    """Fetch up to 50 comma-separated live symbols concurrently."""
+    """Fetch up to 50 comma-separated symbols concurrently.
+
+    Read-path marks are delayed up to papertrade.QUOTE_TTL_SEC to respect
+    Yahoo rate limits; fills always price live."""
     requested = [s.strip().upper() for s in symbols.split(",") if s.strip()][:50]
     if not requested:
         return "error: no symbols"
 
     def fetch(symbol):
         try:
-            return symbol, pt.live_price(symbol), None
+            return symbol, pt.latest_quote(symbol)["last"], None
         except SystemExit as exc:
             return symbol, None, str(exc)
 

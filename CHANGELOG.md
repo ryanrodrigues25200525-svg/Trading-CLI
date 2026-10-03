@@ -4,6 +4,34 @@ All notable changes to tradingcli are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.5.1] — 2026-10-03
+
+### Added
+
+- Server-side quote delay: `latest_quote` / `bulk_quotes` / `market_snapshot`
+  marks are cached up to `QUOTE_TTL_SEC` (60s); failures are never cached.
+  Fills and ticks always price live. `pt.clear_quote_cache()` forces fresh.
+- `test_quote_cache.py` proving delayed reads, TTL expiry, and no stale fills.
+- `Dockerfile` (pinned Python 3.11 + requirements + Bun 1.4.2) — verified by
+  build + in-container `--version`, accounts flow, and 60-tool MCP import.
+
+### Changed
+
+- TUI display quotes are 15-minute delayed (`QUOTE_TTL_MS`); failed auto-tick
+  backs off 60s (manual `t` unaffected).
+- TUI snapshot survives tick failure: panels + pending render with a `tickError`
+  note instead of a blank error.
+- TUI color (gains/losses/accents, valid greys), airy layout with rules and an
+  aligned stats grid; transient tick notices demoted below the red error box.
+
+### Fixed
+
+- `dash` exec failures now raise a clean error instead of falling through;
+  parity packaging assertion narrowed to the wheel `include` block;
+  `web_ui.py` wheel wording corrected in the agent guide.
+
 ## [0.5.0] — 2026-10-03
 
 ### Added
