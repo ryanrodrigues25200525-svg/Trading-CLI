@@ -6,7 +6,7 @@ Stocks / ETFs / crypto (`BTC-USD`) / FX (`EURUSD=X`) / futures (`ES=F`) / equity
 
 ## Setup
 
-Requires Python 3.10+.
+Requires Python 3.10+ and Bun >=1.4.1 (the `tradingcli-tui` dashboard runs on Bun + OpenTUI).
 
 ```bash
 # from source
@@ -22,10 +22,19 @@ Database defaults to `~/.papertrade.db`; override with `PAPERTRADE_DB=/tmp/test.
 ## Run
 
 ```bash
-# first-run wizard + live TUI dashboard
+# first-run wizard + live TUI dashboard (Bun + OpenTUI)
 python3 papertrade.py            # or: tradingcli
 # explicit dash
-python3 papertrade.py dash       # or: tradingcli dash
+python3 papertrade.py dash       # or: tradingcli dash (or: tradingcli-tui)
+# legacy Rich dashboard
+python3 papertrade.py dash --rich
+```
+
+```bash
+# headless snapshot for agents / scripting (single JSON envelope, no TTY)
+tradingcli-tui --headless --json snapshot
+tradingcli-tui --headless --json snapshot -a mybook
+tradingcli-tui --headless --json backtest -a mybook --lookback-days 1825
 ```
 
 ```bash
@@ -69,17 +78,9 @@ Every command accepts one automation flag: `--json` / `--csv` / `--quiet`. `--sc
 
 Press `g` in the TUI to open **Backtesting & Graphs** — live equity curve beside a `backtesting.py` current-holdings backtest (return, CAGR, vol, Sharpe, Sortino, costs, maxDD). Universe is the selected account's open positions; `6m / 1y / 2y / 5y / 10y / max` presets or exact days. CAGR uses real calendar elapsed time; options appear as `skipped` (no point-in-time chain history); futures use continuous series without roll costs. Curves are time-weighted, so deposits/withdrawals don't masquerade as alpha. The result has intentional look-ahead/survivorship bias — it's a "what if we held today's book" retrospective, not an OOS strategy test. Yahoo adjusted closes are used; crypto top-of-book is indicative.
 
-## REST + web UI
+## Web UI (unsupported)
 
-```bash
-python3 web_ui.py                    # http://127.0.0.1:8080  (or: tradingcli-web) — localhost only, no auth
-uvicorn web_ui:app --port 8080       # alternative
-HOST=0.0.0.0 PORT=3000 python3 web_ui.py  # expose to network (no auth — do not do this on untrusted networks)
-```
-
-- `GET /` → SPA (`static/index.html`, Chart.js). Tabs: Portfolio / Orders / Watchlists / Backtest / Settings.
-- Binds to `127.0.0.1` by default; mutating routes have no auth — do not expose to the network. CORS is limited to `localhost:8080`/`3000`.
-- `GET /api/accounts`, `/api/positions?account=…`, `/api/orders?account=…`, `/api/watchlists`, `/api/backtest?account=…&days=365`, `/api/equity-curve`, `/api/market/status`, `/api/market/quote/{symbol}`, `/api/market/history/{symbol}`, `/api/health`, `/api/config`. All return `{"ok": true, "data": …}` or `{"ok": false, "error": "…"}`.
+`web_ui.py` + `static/` are retained in the repo but unsupported and excluded from the wheel — use the TUI, CLI `--json`, or MCP server instead.
 
 ## MCP server (for Claude Code / Cursor / Hermes)
 
@@ -130,6 +131,11 @@ python3 test_edge_cases.py
 python3 test_market_data.py
 python3 test_mcp_features.py
 python3 test_invariants.py
+python3 test_tui_parity.py
+```
+
+```bash
+bun test ./tui/tests/
 ```
 
 
@@ -140,7 +146,5 @@ tradingcli events --since-id 0 --limit 20 --json
 tradingcli export -a mybook --format parquet --output mybook.parquet
 tradingcli perf -a mybook --benchmark SPY --json
 ```
-
-Web streaming: `GET /api/events/stream?since_id=0` (SSE) and `WS /ws` for live health.
 
 Yahoo Finance supplies market data. Historical quote/trade series and crypto top-of-book are explicitly marked aggregated/indicative — not exchange tick tapes or full depth.

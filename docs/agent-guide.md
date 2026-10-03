@@ -8,11 +8,12 @@
 |---|---|
 | `papertrade.py` | CLI + library. Every command is a function taking `(conn, ...)` — import and call directly for fastest agent use. |
 | `mcp_server.py` | MCP server (54 core / 66 advanced / 73 full tools). Preferred agent entry point over raw CLI. |
-| `dashboard.py` | Rich TUI (`tradingcli dash`). Not useful headless. |
-| `web_ui.py` | FastAPI REST + static SPA (`/api/*`, `static/index.html`). |
+| `dashboard.py` | Legacy Rich dashboard (`tradingcli dash --rich`). Superseded by the TUI. |
+| `tui/` | OpenTUI dashboard (Bun + `@opentui/react`): `tradingcli-tui` / `tradingcli dash`. Headless: `tradingcli-tui --headless --json snapshot` (single `{ok, data}` envelope, no TTY — prefer this or MCP over screen-scraping). |
+| `web_ui.py` | Unsupported (retained file, not advertised, excluded from the wheel). |
 | `portfolio_backtest.py` | `backtesting.py` engine for current-holdings retrospective. |
 | `test_*.py` | Standalone scripts (`python3 test_papertrade.py`), not `pytest`. |
-| `static/index.html` | Single-page frontend (Chart.js). Served by `web_ui.py`. |
+| `static/index.html` | Unsupported legacy SPA (retained file, excluded from the wheel). |
 
 ## Environment
 
@@ -136,7 +137,16 @@ python3 test_mcp_server.py
 python3 test_mcp_profiles.py
 python3 test_backtesting.py
 python3 test_dashboard.py
+python3 test_tui_parity.py   # Rich-vs-TUI parity (temp DB; use as the TUI regression gate)
+bun test ./tui/tests/        # Bun-side unit tests (chart/engine/headless/modals)
 # plus test_alpaca_parity / test_cli / test_concurrency / test_invariants / test_market_data / test_mcp_features
+```
+
+Headless TUI recipe (no TTY; prefer MCP or this over screen-scraping):
+
+```bash
+tradingcli-tui --headless --json snapshot -a mybook
+tradingcli-tui --headless --json backtest -a mybook --lookback-days 1825
 ```
 
 

@@ -31,6 +31,7 @@ dependencies = [
 
 [project.scripts]
 tradingcli = "papertrade:main"
+tradingcli-tui = "papertrade:main_tui_shim"
 tradingcli-web = "web_ui:main"
 tradingcli-mcp = "mcp_server:main"
 
@@ -38,7 +39,7 @@ tradingcli-mcp = "mcp_server:main"
 Homepage = "https://github.com/ryanrodrigues25200525-svg/tradingcli"
 
 [tool.hatch.build]
-include = ["LICENSE", "docs/agent-guide.md", "papertrade.py", "mcp_server.py", "dashboard.py", "web_ui.py", "portfolio_backtest.py", "static/", "README.md"]
+include = ["LICENSE", "docs/agent-guide.md", "papertrade.py", "mcp_server.py", "dashboard.py", "web_ui.py", "portfolio_backtest.py", "README.md"]
 
 [tool.hatch.build.targets.wheel]
 packages = []

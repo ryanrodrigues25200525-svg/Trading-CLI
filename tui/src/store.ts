@@ -176,8 +176,8 @@ function asAccounts(payload: unknown): AccountRecord[] {
     .map((a) => ({
       name: String(a["name"] ?? ""),
       cash: num(a["cash"]),
-      // `accounts --json` reports cash only; deposits/realized stay 0 until a
-      // richer CLI shape lands — stats still render, never NaN.
+      // `accounts --detail --json` carries these; plain `accounts --json`
+      // reports cash only, so the 0-fallbacks stay for that shape.
       deposits: num(a["deposits"]),
       realized: num(a["realized"]),
       isDefault: a["default"] === true,
@@ -302,7 +302,8 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
   const today = opts.today ?? todayStr();
 
   const fetchAll = async () => {
-    const accounts = asAccounts(await snapshot(undefined, engineOpts)).filter(
+    // `--detail` carries deposits/realized/created so TOTAL/return match Rich.
+    const accounts = asAccounts(await runCli(["accounts", "--detail"], engineOpts)).filter(
       (a) => !opts.account || a.name === opts.account,
     );
     const perAccount = await Promise.all(

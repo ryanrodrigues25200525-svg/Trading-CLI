@@ -4692,7 +4692,12 @@ def _build_parser():
     c = sub.add_parser("new", help="create account")
     c.add_argument("name")
     c.add_argument("--cash", type=float, default=100_000)
-    sub.add_parser("accounts", help="list accounts")
+    acc = sub.add_parser("accounts", help="list accounts")
+    acc.add_argument(
+        "--detail",
+        action="store_true",
+        help="include deposits, realized pnl, and creation time (TUI uses this)",
+    )
     u = sub.add_parser("use", help="set default account")
     u.add_argument("name")
     for side in ("buy", "sell"):
@@ -4943,7 +4948,16 @@ def _build_parser():
     imp.add_argument("--idempotency-key")
     sub.add_parser("backup", help="create a DB backup under ~/.papertrade_backups")
     sub.add_parser("doctor", help="check DB integrity, schema, counts")
-    sub.add_parser("dash", help="launch the live TUI dashboard")
+    dash_p = sub.add_parser("dash", help="launch the live TUI dashboard")
+    dash_p.add_argument(
+        "--rich",
+        action="store_true",
+        help="use the legacy Rich dashboard instead of the OpenTUI app",
+    )
+    dash_p.add_argument("-a", "--account", help="dashboard account filter")
+    dash_p.add_argument(
+        "-n", "--interval", type=float, default=2.0, help="refresh interval in seconds"
+    )
     sub.add_parser("cancel", help="cancel one pending order (shorthand)").add_argument("order_id", type=int)
     remove = sub.add_parser("rm", help="delete an account and all its data")
     remove.add_argument("name")
@@ -5060,10 +5074,24 @@ def main(argv=None, _inner=False):
 
 def _run_cli(args):
     if args.cmd == "dash":
-        script = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), "dashboard.py"
-        )
-        os.execv(sys.executable, [sys.executable, script])
+        base = os.path.dirname(os.path.realpath(__file__))
+        passthrough = []
+        if getattr(args, "account", None):
+            passthrough += ["-a", args.account]
+        if getattr(args, "interval", 2.0) != 2.0:
+            passthrough += ["-n", str(args.interval)]
+        if not getattr(args, "rich", False):
+            import shutil
+
+            bun = shutil.which("bun")
+            if bun is None:
+                raise SystemExit(
+                    "tradingcli dash needs Bun >=1.4.1 on PATH (https://bun.sh);"
+                    " use 'tradingcli dash --rich' for the legacy dashboard"
+                )
+            # exec inherits environ, so PAPERTRADE_DB flows into the TUI.
+            os.execv(bun, [bun, os.path.join(base, "tui", "src", "index.ts"), *passthrough])
+        os.execv(sys.executable, [sys.executable, os.path.join(base, "dashboard.py"), *passthrough])
     if args.cmd == "chain":
         show_chain(args.underlying, args.expiry)
         return
@@ -5136,16 +5164,32 @@ def _run_cli(args):
             default = conn.execute(
                 "SELECT value FROM config WHERE key='default_account'"
             ).fetchone()
-            result = [
-                {
-                    "name": name,
-                    "cash": cash,
-                    "default": bool(default and name == default[0]),
-                }
-                for name, cash in conn.execute(
-                    "SELECT name,cash FROM accounts ORDER BY name"
-                )
-            ]
+            is_default = lambda name: bool(default and name == default[0])  # noqa: E731
+            if getattr(args, "detail", False):
+                result = [
+                    {
+                        "name": name,
+                        "cash": cash,
+                        "deposits": deposits,
+                        "realized": realized,
+                        "created": created,
+                        "default": is_default(name),
+                    }
+                    for name, cash, deposits, realized, created in conn.execute(
+                        "SELECT name,cash,deposits,realized,created FROM accounts ORDER BY name"
+                    )
+                ]
+            else:
+                result = [
+                    {
+                        "name": name,
+                        "cash": cash,
+                        "default": is_default(name),
+                    }
+                    for name, cash in conn.execute(
+                        "SELECT name,cash FROM accounts ORDER BY name"
+                    )
+                ]
             print(json.dumps(result, indent=2))
         elif args.cmd == "use":
             set_default(conn, args.name)
@@ -5501,6 +5545,22 @@ def _run_cli(args):
                 show_perf(conn, account)
     finally:
         conn.close()
+
+
+def main_tui_shim(argv=None):
+    """`tradingcli-tui` console script: replace this process with the Bun app.
+
+    Minimal shim — it never touches the engine, it only execs
+    `bun tui/src/index.ts`. PAPERTRADE_DB and friends flow via environ.
+    """
+    import shutil
+
+    bun = shutil.which("bun")
+    if bun is None:
+        raise SystemExit("tradingcli-tui needs Bun >=1.4.1 on PATH (https://bun.sh)")
+    entry = os.path.join(os.path.dirname(os.path.realpath(__file__)), "tui", "src", "index.ts")
+    extra = list(sys.argv[1:] if argv is None else argv)
+    os.execv(bun, [bun, entry, *extra])
 
 
 if __name__ == "__main__":
