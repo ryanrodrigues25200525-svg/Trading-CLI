@@ -201,10 +201,10 @@ export function App({
   const defaultName = snap?.panels.find((p) => p.isDefault)?.name ?? account;
 
   return (
-    <box flexDirection="column">
+    <box flexDirection="column" gap={1}>
       <text fg="#ff2b4a">{LOGO}</text>
       {error !== null ? (
-        <box border borderStyle="single" borderColor="red">
+        <box border borderStyle="single" borderColor="red" padding={1}>
           <text fg="red">engine error: {shortError(error)}</text>
         </box>
       ) : null}

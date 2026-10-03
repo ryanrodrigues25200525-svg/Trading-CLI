@@ -391,8 +391,9 @@ describe("panel colors", () => {
 });
 
 describe("quote cache (Yahoo rate-limit)", () => {
-  // Display-quote TTL is 15_000 ms (QUOTE_TTL_MS in store.ts); tests pin it
+  // Display quotes are 15-minute delayed (QUOTE_TTL_MS); tests pin it
   // with literals plus nowMs control so no real waiting is involved.
+  const QUARTER_HOUR = 900_000;
   const CACHE_BOOK = {
     accounts: [{ name: "main", cash: 24900, default: true }],
     positions: [
@@ -437,7 +438,7 @@ describe("quote cache (Yahoo rate-limit)", () => {
     const { spawn, counts } = countingSpawn(mockCli(CACHE_BOOK));
     await loadSnapshot({ spawn, nowMs: 1_000_000 });
     expect(counts.quotes).toBe(1);
-    const later = await loadSnapshot({ spawn, nowMs: 1_000_000 + 15_000 + 1 });
+    const later = await loadSnapshot({ spawn, nowMs: 1_000_000 + QUARTER_HOUR + 1 });
     expect(later.quotes["MSFT"]?.[0]).toBeCloseTo(101, 6);
     expect(counts.quotes).toBe(2);
   });
@@ -459,8 +460,7 @@ describe("quote cache (Yahoo rate-limit)", () => {
     expect(counts.quotes).toBe(1);
   });
 
-  test("post-tick re-snapshot is fresh even within TTL", async () => {
-    let ticks = 0;
+  test("post-tick re-snapshot is fresh even within TTL", async () => {    let ticks = 0;
     const { spawn, counts } = countingSpawn(
       mockCli({
         ...CACHE_BOOK,
@@ -515,5 +515,50 @@ describe("quote cache (Yahoo rate-limit)", () => {
     expect(snap.pending).toHaveLength(1);
     expect(snap.pending[0]!.label).toContain("#9");
     expect(snap.tickError).not.toBeNull();
+  });
+
+  test("failed auto-tick backs off for a minute", async () => {
+    const base = mockCli({
+      ...CACHE_BOOK,
+      orders: [
+        {
+          id: 9, account: "main", symbol: "MSFT", side: "buy", qty: 1.0,
+          order_type: "limit", limit_price: 350, stop_price: null,
+          trail_price: null, trail_percent: null, time_in_force: "gtc", status: "pending",
+        },
+      ],
+      tickFails: true,
+    });
+    const { spawn, counts } = countingSpawn(base);
+    const first = await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(counts.ticks).toBe(1);
+    expect(first.tickError).not.toBeNull();
+    expect(counts.quotes).toBe(2); // pre-tick fetch + post-failure fresh re-snapshot
+    // 30s later: no new tick attempt, no new quote calls, error retained.
+    const second = await loadSnapshot({ spawn, nowMs: 1_000_000 + 30_000 });
+    expect(counts.ticks).toBe(1);
+    expect(second.panels).toHaveLength(1);
+    expect(second.tickError).not.toBeNull();
+    expect(counts.quotes).toBe(2);
+  });
+
+  test("auto-tick retries after the cooldown", async () => {
+    const { spawn, counts } = countingSpawn(
+      mockCli({
+        ...CACHE_BOOK,
+        orders: [
+          {
+            id: 9, account: "main", symbol: "MSFT", side: "buy", qty: 1.0,
+            order_type: "limit", limit_price: 350, stop_price: null,
+            trail_price: null, trail_percent: null, time_in_force: "gtc", status: "pending",
+          },
+        ],
+        tickFails: true,
+      }),
+    );
+    await loadSnapshot({ spawn, nowMs: 1_000_000 });
+    expect(counts.ticks).toBe(1);
+    await loadSnapshot({ spawn, nowMs: 1_000_000 + 61_000 });
+    expect(counts.ticks).toBe(2);
   });
 });

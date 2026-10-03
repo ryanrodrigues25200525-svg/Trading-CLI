@@ -95,24 +95,43 @@ export interface LoadSnapshotOpts {
   nowMs?: number;
   /** Bypass the quote cache (post-tick re-snapshot always sets this). */
   freshQuotes?: boolean;
+  /** Auto-tick backoff after a failed tick in ms (tests); defaults to TICK_FAIL_COOLDOWN_MS. */
+  tickCooldownMs?: number;
 }
 
-/** Display-quote TTL: Yahoo marks are cached this long to avoid rate-limiting.
+/** Display quotes are 15-minute delayed to respect Yahoo rate limits.
  * Fills/ticks always use live prices server-side; only the display path reads here. */
-export const QUOTE_TTL_MS = 15_000;
+export const QUOTE_TTL_MS = 15 * 60_000;
+
+/** After a failed auto-tick, wait this long before trying again. Manual `t` is unaffected. */
+export const TICK_FAIL_COOLDOWN_MS = 60_000;
 
 type CachedQuote = { quote: [number, number | null] | null; atMs: number };
-// Per-spawn caches: the live TUI reuses one spawn (one cache per process),
-// while tests with distinct stubs stay isolated from each other.
-const quoteCaches = new WeakMap<object, Map<string, CachedQuote>>();
-const defaultQuoteCache = new Map<string, CachedQuote>();
 
-function cacheFor(spawn: SpawnFn | undefined): Map<string, CachedQuote> {
-  if (!spawn) return defaultQuoteCache;
-  let m = quoteCaches.get(spawn);
+interface SpawnState {
+  quotes: Map<string, CachedQuote>;
+  lastTickFailureAt: number | null;
+  lastTickFailureMsg: string | null;
+}
+// Per-spawn state: the live TUI reuses one spawn (one cache per process),
+// while tests with distinct stubs stay isolated from each other.
+const spawnStates = new WeakMap<object, SpawnState>();
+const defaultSpawnState: SpawnState = {
+  quotes: new Map<string, CachedQuote>(),
+  lastTickFailureAt: null,
+  lastTickFailureMsg: null,
+};
+
+function stateFor(spawn: SpawnFn | undefined): SpawnState {
+  if (!spawn) return defaultSpawnState;
+  let m = spawnStates.get(spawn);
   if (!m) {
-    m = new Map<string, CachedQuote>();
-    quoteCaches.set(spawn, m);
+    m = {
+      quotes: new Map<string, CachedQuote>(),
+      lastTickFailureAt: null,
+      lastTickFailureMsg: null,
+    };
+    spawnStates.set(spawn, m);
   }
   return m;
 }
@@ -346,7 +365,9 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
   const today = opts.today ?? todayStr();
   const ttlMs = opts.quoteTtlMs ?? QUOTE_TTL_MS;
   const nowMs = opts.nowMs ?? Date.now();
-  const cache = cacheFor(opts.spawn);
+  const cooldownMs = opts.tickCooldownMs ?? TICK_FAIL_COOLDOWN_MS;
+  const state = stateFor(opts.spawn);
+  const cache = state.quotes;
 
   const fetchAll = async (fresh: boolean) => {
     // `--detail` carries deposits/realized/created so TOTAL/return match Rich.
@@ -383,20 +404,31 @@ export async function loadSnapshot(opts: LoadSnapshotOpts = {}): Promise<Dashboa
       positions.some((p) => isExpiredOcc(p.symbol, today)),
     );
   let tickError: string | null = null;
-  if (needsTick) {
+  const coolingDown =
+    state.lastTickFailureAt !== null && nowMs - state.lastTickFailureAt < cooldownMs;
+  if (needsTick && !coolingDown) {
     try {
       await tick(engineOpts);
+      state.lastTickFailureAt = null;
+      state.lastTickFailureMsg = null;
     } catch (e) {
       // A failed tick (e.g. Yahoo rate-limit) must not nuke the read-only
       // snapshot: fills may still have landed, so re-snapshot below and
       // surface the message alongside the panels instead of throwing.
-      tickError = e instanceof Error ? e.message : String(e);
+      // Further auto-ticks back off until the cooldown elapses; manual `t`
+      // always runs immediately.
+      const message = e instanceof Error ? e.message : String(e);
+      state.lastTickFailureAt = nowMs;
+      state.lastTickFailureMsg = message;
+      tickError = message;
     }
     try {
       ({ perAccount, quotes } = await fetchAll(true));
     } catch {
       // Re-snapshot failed too — keep the pre-tick data already in hand.
     }
+  } else if (needsTick) {
+    tickError = state.lastTickFailureMsg;
   }
 
   const clock = asClock(await marketClock(engineOpts));

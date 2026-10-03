@@ -33,7 +33,7 @@ const HINTS: Array<[key: string, label: string]> = [
 export function StatusBar({ clock, asOf }: { clock: MarketClockInfo; asOf: string }) {
   const dot = clock.isOpen ? GREEN : GREY;
   return (
-    <box flexDirection="column">
+    <box flexDirection="column" gap={1}>
       <box border borderStyle="single" borderColor={RED}>
         <text>
           <span fg={dot}>{clock.isOpen ? "●" : "■"}</span>

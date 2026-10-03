@@ -160,6 +160,7 @@ export function AccountPanelView({ panel }: { panel: AccountPanel }) {
     ),
   );
   if (panel.pending.length > 0) {
+    lines.push(<text key="sep">{" "}</text>);
     lines.push(
       <text key="pending" fg={YELLOW}>
         {`◌ pending: ${panel.pending.map((o) => o.label).join(", ")}`}
@@ -175,6 +176,7 @@ export function AccountPanelView({ panel }: { panel: AccountPanel }) {
       titleColor={accent}
       titleAlignment="left"
       flexDirection="column"
+      padding={1}
     >
       {lines}
     </box>
@@ -184,13 +186,13 @@ export function AccountPanelView({ panel }: { panel: AccountPanel }) {
 export function PortfolioPanels({ panels }: { panels: AccountPanel[] }) {
   if (panels.length === 0) {
     return (
-      <box border borderStyle="single" borderColor={GREY}>
+      <box border borderStyle="single" borderColor={GREY} padding={1}>
         <text fg={GREY}>no accounts — create one with: tradingcli new NAME</text>
       </box>
     );
   }
   return (
-    <box flexDirection="column">
+    <box flexDirection="column" gap={1}>
       {panels.map((p) => (
         <AccountPanelView key={p.name} panel={p} />
       ))}
